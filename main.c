@@ -1,18 +1,16 @@
 /*
 ******************************************************************
+udbbroadcastrelay (c)2020 Martin Wasley <github.com/marjohn56> & Berto Furth <github.com/bertofurth>
 udp-broadcast-relay-redux
     Relays UDP broadcasts to other networks, forging
     the sender address.
-
 Copyright (c) 2017 Michael Morrison <github.com/sonicsnes>
 Copyright (c) 2003 Joachim Breitner <mail@joachim-breitner.de>
 Copyright (C) 2002 Nathan O'Sullivan
-
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
 as published by the Free Software Foundation; either version 2
 of the License, or (at your option) any later version.
-
 This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
@@ -22,6 +20,11 @@ GNU General Public License for more details.
 
 #define MAXIFS    256
 #define MAXMULTICAST 256
+/*
+ * MAXID used to be 99 when TTL was marked with the ID but
+ * now that DSCP is used it needs to be limited to 6 bits.
+ */
+#define MAXID   63
 #define DPRINT  if (debug) printf
 #define IPHEADER_LEN 20
 #define UDPHEADER_LEN 8
@@ -100,11 +103,70 @@ void catch_sigterm()
     sigaction(SIGTERM, &_sigact, NULL);
 }
 
+void display_usage(FILE *stream, const char *arg0) {
+    fprintf(stream, "usage: %s [--id ID] [--port udp-port]\n"
+	    "       [--dev dev1] [--dev dev2] [--dev devX]\n"
+	    "       [-s IP] [--multicast ip1] [--multicast ipX]\n"
+            "       [-t|--ttl-id] [-d] [-f]\n"
+	    "       [-h|--help]\n", arg0);
+}
+
+void display_help(const char *arg0) {
+    printf("This program listens for packets on a specified UDP broadcast\n"
+	   "port. When a packet is received, it sends that packet to all\n"
+	   "specified interfaces but the one it came from as though it\n"
+	   "originated from the original sender.\n"
+	   "The primary purpose of this is to allow devices or game servers\n"
+	   "on separated local networks (Ethernet, WLAN, VLAN) that use udp\n"
+	   "broadcasts to find each other to do so.\n");
+    printf("Required Parameters:\n"
+	   "  --id ID  Set a unique ID for this instance of the tool.\n"
+	   "           Valid range 1 - %i. The IP DSCP field of a relayed\n"
+	   "           packet is set to this value so the tool may\n"
+	   "           identify and drop already relayed packets in order\n"
+	   "           to avoid packet storms.\n"
+	   "  --port udp-port   Destination UDP port to listen for.\n"
+	   "                    Valid range 1 - 65535.\n"
+	   "                    e.g.  5353 - mDNS/Chromecast/Apple Bonjour\n"
+	   "                          1900 - UPnP Discovery/SSDP\n"
+	   "                          37 - NetBIOS name service (Windows)\n"
+	   "                          38 - SMB Browser (Windows)\n"
+	   "                    Only specify one udp-port per instance.\n"
+	   "  --dev device   Name of an interface to listen for and to \n"
+	   "                 relay packets to. This option must be specified\n"
+	   "                 at least twice for two separate interfaces in\n"
+	   "                 order for this tool to have any effect.\n", MAXID);
+    printf("Optional Parameters:\n"
+	   "  -s IP    Sets the source IP of forwarded packets. If not\n"
+	   "           specified the original IP source address is used.\n"
+	   "           Special values :\n"
+	   "           1.1.1.1 - Use the outgoing interface ip address as\n"
+	   "                     source IP. Also forces the outgoing packet\n"
+	   "                     source UDP port to the same as the destination\n"
+	   "                     UDP port.\n"
+	   "           1.1.1.2 - Use the outgoing interface ip address as \n"
+	   "                     source IP. Does not modify UDP ports.\n"
+	   "           These special values help in rare cases e.g. Chromecast\n"
+	   "  --multicast IP   As well as listening for broadcasts the program\n"
+	   "                   will listen for and relay multicast packets\n"
+	   "                   using the specified multicast IP address(es).\n"
+	   "                   e.g. 224.0.0.251 - mDNS/Chromecast/Apple Bonjour\n"
+	   "                        239.255.255.250 - UPnP Discovery/SSDP\n"
+	   "                   This argument may be specified more than once.\n"
+	   "  --ttl-id|-t   Preserve DSCP and mark relayed packets by setting\n"
+	   "                the IP TTL header field to ID + %i. This is how the\n"
+	   "                original version of this tool operated by default.\n"
+	   "  -d       Enables debugging.\n"
+	   "  -f       Forces forking to background. A PID file will be created\n"
+	   "           at /var/run/udpbroadcastrelay_ID.pid\n"
+	   "  --help|-h   Display this detailed help dialog.\n", TTL_ID_OFFSET);
+}
 
 int main(int argc,char **argv) {
     /* Debugging, forking, other settings */
     FILE *pidfp;
     int debug = 0, forking = 0, pid;
+    int use_ttl_id = 0;
     u_int16_t port = 0;
     u_char id = 0;
     char *usr_pid = 0;
@@ -137,32 +199,25 @@ srandom(time(NULL) & getpid());
 
 
     if(argc < 2) {
-        fprintf(stderr,"usage: %s [-d] [-f] [-p] [-s IP] [--id id] [--port udp-port] [--dev dev1]... [--multicast ip]... \n\n",*argv);
-        fprintf(stderr,"This program listens for broadcast  packets  on the  specified UDP port\n"
-            "and then forwards them to each other given interface.  Packets are sent\n"
-            "such that they appear to have come from the original broadcaster, resp.\n"
-            "from the spoofing IP in case -s is used.  When using multiple instances\n"
-            "for the same port on the same network, they must have a different id.\n\n"
-            "    -d      enables debugging\n"
-            "    -f      forces forking to background\n"
-            "    -s IP   sets the source IP of forwarded packets; otherwise the\n"
-            "            original sender's address is used.\n"
-            "            Setting to 1.1.1.1 uses outgoing interface address and broadcast port.\n"
-            "            (helps in some rare cases)\n"
-            "            Setting to 1.1.1.2 uses outgoing interface address and source port.\n"
-            "            (helps in some rare cases)\n"
-            "\n"
-        );
-        exit(1);
+	display_usage(stderr, argv[0]);
+	exit(1);
     }
 
-    for (int i = 1; i < argc; i++) {
+    int i;
+    for (i = 1; i < argc; i++) {
         if (strcmp(argv[i],"-d") == 0) {
             DPRINT ("Debugging Mode enabled\n");
             debug = 1;
         }
+	if ((strcmp(argv[i], "--help") == 0) ||
+	    (strcmp(argv[i], "-h") == 0)) {
+	    display_usage(stdout, argv[0]);
+	    display_help(argv[0]);
+	    exit(0);
+	}
     }
-    for (int i = 1; i < argc; i++) {
+
+    for (i = 1; i < argc; i++) {
         if (strcmp(argv[i],"-d") == 0) {
             // Already handled
         } else if (strcmp(argv[i],"-f") == 0) {
@@ -189,18 +244,34 @@ srandom(time(NULL) & getpid());
         else if (strcmp(argv[i],"--port") == 0) {
             i++;
             port = atoi(argv[i]);
-            DPRINT ("Port set to %i\n", id);
+            DPRINT ("Port set to %i\n", port);
         }
         else if (strcmp(argv[i],"--dev") == 0) {
+	    if (interfaceNamesNum >= MAXIFS) {
+		fprintf(stderr, "More than %i interfaces specified.\n", MAXIFS);
+		exit(1);
+	    }
             i++;
             interfaceNames[interfaceNamesNum] = argv[i];
             interfaceNamesNum++;
         }
+        else if (strcmp(argv[i],"--pid") == 0) {
+            i++;
+            usr_pid = argv[i];            
+        }
         else if (strcmp(argv[i],"--multicast") == 0) {
+	    if (multicastAddrsNum >= MAXMULTICAST) {
+		fprintf(stderr, "More than %i multicast addresses specified", MAXMULTICAST);
+		exit(1);
+	    }
             i++;
             multicastAddrs[multicastAddrsNum] = argv[i];
             multicastAddrsNum++;
         }
+	else if ((strcmp(argv[i], "--ttl-id") == 0) ||
+		 (strcmp(argv[i], "-t") == 0)) {
+	    use_ttl_id = 1;
+	}
         else if (strncmp(argv[i], "-", 1) == 0) {
             fprintf (stderr, "Unknown arg: %s\n", argv[i]);
             exit(1);
@@ -210,9 +281,9 @@ srandom(time(NULL) & getpid());
         }
     }
 
-    if (id < 1 || id > 99)
+    if (id < 1 || id > MAXID)
     {
-        fprintf (stderr,"ID argument %i not between 1 and 99\n",id);
+        fprintf (stderr,"ID argument %i not between 1 and %i\n", id, MAXID);
         exit(1);
     }
     if (port < 1 || port > 65535) {
@@ -223,9 +294,24 @@ srandom(time(NULL) & getpid());
 
 	
     
-    u_char ttl = id+TTL_ID_OFFSET;
+    u_char ttl = 0;
+    u_char tos = 0;
+    if (use_ttl_id) {
+	ttl = id + TTL_ID_OFFSET;
+	DPRINT ("ID: %i (ttl: %i), Port %i\n",id,ttl,port);
+    } else {
+	/*
+	 * DSCP occupies the most significant 6 bits of the IP
+	 * TOS field. We do not use the remaining 2 bits (ECN)
+	 * because there are reports that in rare cases hosts
+	 * can react poorly to these being set spuriously.
+	 */
+	tos = id << 2;
+	DPRINT ("ID: %i (DSCP: %i, ToS: 0x%02x), Port %i\n", id, id,
+		tos, port);
+    }
 
-    DPRINT ("ID: %i (ttl: %i), Port %i\n",id,ttl,port);
+
 
     /* We need to find out what IP's are bound to this host - set up a temporary socket to do so */
     int fd;
@@ -367,10 +453,12 @@ srandom(time(NULL) & getpid());
                 if((setsockopt(iface->raw_socket, IPPROTO_IP, IP_MULTICAST_IF, &iface->ifaddr, sizeof(iface->ifaddr))) < 0) {
                     perror("setsockopt IP_MULTICAST_IF");
                 }
-                int setttl = ttl;
-                if((setsockopt(iface->raw_socket, IPPROTO_IP, IP_MULTICAST_TTL, &setttl, sizeof(setttl))) < 0) {
-                    perror("setsockopt IP_MULTICAST_TTL");
-                }
+		if (use_ttl_id) {
+		    int setttl = ttl;
+		    if((setsockopt(iface->raw_socket, IPPROTO_IP, IP_MULTICAST_TTL, &setttl, sizeof(setttl))) < 0) {
+			perror("setsockopt IP_MULTICAST_TTL");
+		    }
+		}
             #else
                 // bind socket to dedicated NIC (override routing table)
                 if (setsockopt(iface->raw_socket, SOL_SOCKET, SO_BINDTODEVICE, interfaceNames[i], strlen(interfaceNames[i])+1)<0)
@@ -412,6 +500,10 @@ srandom(time(NULL) & getpid());
                 perror("IP_RECVTTL on rcv");
                 exit(1);
             };
+	    if(setsockopt(rcv, IPPROTO_IP, IP_RECVTOS, &yes, sizeof(yes))<0){
+		perror("IP_RECVTOS on rcv");
+		exit(1);
+	    };
             if(setsockopt(rcv, IPPROTO_IP, IP_RECVIF, &yes, sizeof(yes))<0){
                 perror("IP_RECVIF on rcv");
                 exit(1);
@@ -425,6 +517,10 @@ srandom(time(NULL) & getpid());
                 perror("IP_RECVTTL on rcv");
                 exit(1);
             };
+	    if(setsockopt(rcv, SOL_IP, IP_RECVTOS, &yes, sizeof(yes))<0){
+		perror("IP_RECVTOS on rcv");
+		exit(1);
+	    };
             if(setsockopt(rcv, SOL_IP, IP_PKTINFO, &yes, sizeof(yes))<0){
                 perror("IP_PKTINFO on rcv");
                 exit(1);
@@ -489,9 +585,11 @@ srandom(time(NULL) & getpid());
         int len = recvmsg(rcv,&rcv_msg,0);
         if (len <= 0) continue;    /* ignore broken packets */
 
-        /* Find the ttl and the receiving interface */
+        /* Find the ToS, ttl and the receiving interface */
         struct cmsghdr *cmsg;
         int rcv_ttl = 0;
+	int rcv_tos = 0;
+	int found_rcv_tos = 0;
         int rcv_ifindex = 0;
         struct in_addr rcv_inaddr;
         int foundRcvIf = 0;
@@ -502,6 +600,10 @@ srandom(time(NULL) & getpid());
                     if (cmsg->cmsg_type==IP_RECVTTL) {
                         rcv_ttl = *(int *)CMSG_DATA(cmsg);
                     }
+		    if (cmsg->cmsg_type==IP_RECVTOS) {
+			rcv_tos = *(int *)CMSG_DATA(cmsg);
+			found_rcv_tos = 1;
+		    }
                     if (cmsg->cmsg_type==IP_RECVDSTADDR) {
                         rcv_inaddr=*((struct in_addr *)CMSG_DATA(cmsg));
                         foundRcvIp = 1;
@@ -514,6 +616,10 @@ srandom(time(NULL) & getpid());
                     if (cmsg->cmsg_type==IP_TTL) {
                         rcv_ttl = *(int *)CMSG_DATA(cmsg);
                     }
+		    if (cmsg->cmsg_type==IP_TOS) {
+			rcv_tos = *(int *)CMSG_DATA(cmsg);
+			found_rcv_tos = 1;
+		    }
                     if (cmsg->cmsg_type==IP_PKTINFO) {
                         rcv_ifindex=((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_ifindex;
                         foundRcvIf = 1;
@@ -536,6 +642,19 @@ srandom(time(NULL) & getpid());
             perror("TTL not found on incoming packet\n");
             continue;
         }
+	if (!found_rcv_tos) {
+	    if (use_ttl_id) {
+		/*
+		 * If we're not using DSCP as the tag field then
+		 * this error doesn't matter but print the warning
+		 * anyway.
+		 */
+		perror("Warning : ToS not found on incoming packet - continuing processing\n");
+	    } else {
+		perror("ToS not found on incoming packet\n");
+		continue;
+	    }
+	}
 
         struct Iface* fromIface = NULL;
         for (int iIf = 0; iIf < maxifs; iIf++) {
@@ -555,16 +674,26 @@ srandom(time(NULL) & getpid());
         inet_ntoa2(origFromAddress, origFromAddressStr, sizeof(origFromAddressStr));
         char origToAddressStr[255];
         inet_ntoa2(origToAddress, origToAddressStr, sizeof(origToAddressStr));
-        DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i ttl=%i)\n",
+        DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i tos=0x%02x DSCP=%i ttl=%i)\n",
             origFromAddressStr, origFromPort,
             origToAddressStr, origToPort,
-            rcv_ifindex, len, rcv_ttl
+	    rcv_ifindex, len, rcv_tos,
+	    rcv_tos >> 2, rcv_ttl
         );
 
-        if (rcv_ttl == ttl) {
-            DPRINT("Echo (Ignored)\n\n");
-            continue;
-        }
+	if (use_ttl_id) {
+	    if (rcv_ttl == ttl) {
+		DPRINT("IP TTL (%i) matches ID (%i) + %i. Packet Ignored.\n\n",
+		       rcv_ttl, id, TTL_ID_OFFSET);
+		continue;
+	    }
+        } else {
+	    if ((rcv_tos & 0xfc) == tos) {
+		DPRINT("IP DSCP (%i) matches ID. IP ToS 0x%2x. Packet Ignored.\n\n",
+		       tos >> 2, tos);
+		continue;
+	    }
+	}
         if (!fromIface) {
             DPRINT("Not from managed iface\n\n");
             continue;
@@ -611,14 +740,38 @@ srandom(time(NULL) & getpid());
             char toAddressStr[255];
             inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
             DPRINT (
-                "-> [ %s:%d -> %s:%d (iface=%d)\n",
+                "-> [ %s:%d -> %s:%d (iface=%d len=%i ",
                 fromAddressStr, fromPort,
                 toAddressStr, toPort,
-                iface->ifindex
-            );
-
+                iface->ifindex, len);
+	    if (use_ttl_id) {
+		DPRINT("tos=0x%02x DSCP=%i ttl=%i)\n",
+		       rcv_tos, rcv_tos >> 2, ttl);
+	    } else {
+		DPRINT("tos=0x%02x DSCP=%i ttl=%i)\n",
+		       tos + (rcv_tos & 0x03), tos >> 2, rcv_ttl);
+	    }
             /* Send the packet */
-            gram[8] = ttl;
+
+	    if (use_ttl_id) {
+		/* Set IP TTL field */
+		/* Note. The following statement has no effect on
+		 * multicast packets, only on relayed broadcasts.
+		 * For mcast packets we have to set socket
+		 * option IP_MULTICAST_TTL to change TTL */
+		gram[8] = ttl;
+	    } else {
+		/*
+		 * Set IP ToS byte so that DSCP = instance ID and ECN is
+		 * preserved from the original packet.
+		 */
+		gram[1] = tos + (rcv_tos & 0x03);
+		/* Set TTL to the same as the received packet */
+		gram[8] = rcv_ttl;
+		if((setsockopt(iface->raw_socket, IPPROTO_IP, IP_MULTICAST_TTL, &rcv_ttl, sizeof(rcv_ttl))) < 0) {
+		    perror("setsockopt IP_MULTICAST_TTL");
+		}
+	    }
             memcpy(gram+12, &fromAddress.s_addr, 4);
             memcpy(gram+16, &toAddress.s_addr, 4);
             *(u_short*)(gram+20)=htons(fromPort);

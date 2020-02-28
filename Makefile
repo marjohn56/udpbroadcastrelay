@@ -1,5 +1,12 @@
-# $FreeBSD$
+VERSION=1.0
 
-PROG=udpbroadcastrelay
+udpbroadcastrelay: main.c
+	$(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
 
-.include <bsd.prog.mk>
+clean:
+	rm -f udpbroadcastrelay
+
+all:
+        $(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
+        cp udpbroadcastrelay /usr/local/bin/
+        chmod 755 /usr/local/bin/udpbroadcastrelay
