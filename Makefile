@@ -7,6 +7,8 @@ clean:
 	rm -f udpbroadcastrelay
 
 all:
-        $(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
-        cp udpbroadcastrelay /usr/local/sbin/
-        chmod 755 /usr/local/sbin/udpbroadcastrelay
+	$(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
+
+install:
+	cp udpbroadcastrelay /usr/local/sbin/
+	chmod 755 /usr/local/sbin/udpbroadcastrelay
