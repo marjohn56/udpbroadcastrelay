@@ -1,4 +1,5 @@
 UDP Broadcast Relay for Linux / FreeBSD / pfSense / OPNsense
+( For Opensense a plugin is already available )
 ==========================
 
 This program listens for packets on a specified UDP broadcast port. When
