@@ -1,14 +1,16 @@
-VERSION=1.0
+PREFIX	?= /usr/local
+CFLAGS	+= -g
+
+all:	udpbroadcastrelay
 
 udpbroadcastrelay: main.c
-	$(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
+	$(CC) $(CFLAGS) $? -o $@
 
 clean:
 	rm -f udpbroadcastrelay
 
-all:
-	$(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
+install: udpbroadcastrelay
+	chmod 0755 udpbroadcastrelay
+	cp -p udpbroadcastrelay $(PREFIX)/sbin/
 
-install:
-	cp udpbroadcastrelay /usr/local/sbin/
-	chmod 755 /usr/local/sbin/udpbroadcastrelay
+.PHONY: all clean install
