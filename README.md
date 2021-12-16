@@ -1,3 +1,8 @@
+work in progress to add SSDP/UPnP DIAL proxy support
+----------------------------------------------------
+added new -s 1.1.1.3 option to proxy UDP responses to M-SEARCH requests.
+
+
 UDP Broadcast Relay for Linux / FreeBSD / pfSense / OPNsense
 ( For Opensense a plugin is already available )
 ==========================
