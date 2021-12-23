@@ -1,6 +1,6 @@
-work in progress to add SSDP/UPnP DIAL proxy support
-----------------------------------------------------
-added new -s 1.1.1.3 option to proxy UDP responses to M-SEARCH requests.
+Test version with working SSDP/UPnP DIAL proxy support
+------------------------------------------------------
+added new -s 1.1.1.3 option to proxy SSDP/DIAL requests. This will create proxies for the UDP M-SEARCH requests and TCP Locator services and REST services connections. The smart TV will see there requests originating from its local subnet.
 
 
 UDP Broadcast Relay for Linux / FreeBSD / pfSense / OPNsense
