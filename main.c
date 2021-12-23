@@ -20,7 +20,13 @@ GNU General Public License for more details.
 
 #define MAXIFS    256
 #define MAXMULTICAST 256
-#define MAXPROXYSOCK 256
+#define MAX_MSEARCH_PROXY 256
+#define MAX_LOCATOR_LISTENER 256
+#define MAX_LOCATOR_PROXIES 256
+#define MAX_REST_LISTENER 256
+#define MAX_REST_PROXIES 256
+
+#define MAX_PROXY_SOCKETS (MAX_MSEARCH_PROXY + MAX_LOCATOR_LISTENER + MAX_LOCATOR_PROXIES + MAX_REST_LISTENER + MAX_REST_PROXIES)
 
 /*
  * MAXID used to be 99 when TTL was marked with the ID but
@@ -55,7 +61,9 @@ GNU General Public License for more details.
 #include <unistd.h>
 #include <signal.h>
 #include <poll.h>
-
+#include <strings.h>
+#include <netdb.h>
+#include <fcntl.h>
 
 static int debug = 0;
 static int exit_ok = 0;
@@ -70,23 +78,10 @@ struct Iface {
     int raw_socket;
 };
 static struct Iface ifs[MAXIFS];
-
-/* list of SSDP reply listner proxy sockets */
-struct ProxySock {
-    time_t expirytime;
-	unsigned int proxyid;
-	struct Iface* clientiface;
-    struct in_addr clienthost;
-    u_short clientport;
-    u_short localport;
-    int sock;
-};
-static struct ProxySock proxysocks[MAXPROXYSOCK];
-static int numproxies= 0;
-static unsigned int nextproxyid= 0;
+static int maxifs = 0;
 
 /* Where we forge our packets */
-static u_char gram[4096]=
+static u_char gram[4096+HEADER_LEN]=
 {
     0x45,    0x00,    0x00,    0x26,
     0x12,    0x34,    0x00,    0x00,
@@ -98,9 +93,1277 @@ static u_char gram[4096]=
     '1','2','3','4','5','6','7','8','9','0'
 };
 
+/* types of sockets we receive data on */
+#define MAIN_SOCKET 0
+#define MSEARCH_SOCKET 1
+#define LOCSVC_LISTENER 2
+#define LOCSVC_CIENTSOCK 3
+#define LOCSVC_SERVERSOCK 4
+#define RESTSVC_LISTENER 5
+#define RESTSVC_CIENTSOCK 6
+#define RESTSVC_SERVERSOCK 7
+
+#define MSEARCH_PROXY_EXPIRY 10
+#define LOCATOR_LISTENER_EXPIRY 10
+#define LOCATOR_PROXY_EXPIRY 10
+#define REST_LISTENER_EXPIRY 10
+#define REST_PROXY_EXPIRY 10
+
+#define BLOCK_RETRY_TIME 10
+
+#define MSEARCH_MARKER "M-SEARCH * HTTP/1.1\r\n"
+#define LOCATION_STRING_PREFIX "LOCATION: http://"
+#define APPLICATION_STRING_PREFIX "Application-URL: http://"
+
+/* list of SSDP M-SEARCH reply listener proxies */
+struct MSEARCHProxy {
+    time_t expirytime;
+    unsigned int proxyid;
+    struct in_addr clienthost;
+    u_short clientport;
+    struct Iface* clientiface;
+    u_short localport;
+    int sock;
+};
+static struct MSEARCHProxy msearch_proxies[MAX_MSEARCH_PROXY];
+static int num_msearch_proxies= 0;
+static unsigned int next_msearch_proxyid= 0;
+
+/* list of DIAL Locator service listners */
+struct LocatorSvcListener {
+    time_t expirytime;
+    unsigned int listenerid;
+    struct in_addr serveraddr;
+    u_short serverport;
+    struct in_addr localaddr;
+    u_short localport;
+    int sock;
+};
+static struct LocatorSvcListener locatorsvc_listeners[MAX_LOCATOR_LISTENER];
+static int num_locatorsvc_listeners= 0;
+static unsigned int next_locatorsvc_listenerid= 0;
+
+/* list of DIAL Locator service proxies */
+struct LocatorSvcProxy {
+    unsigned int proxyid;
+    int clientsock;
+    int serversock;
+    struct in_addr serveraddr;
+    u_short serverport;
+    struct in_addr clientaddr;
+    u_short clientport;
+    struct in_addr slocaladdr;
+    u_short slocalport;
+    struct in_addr clocaladdr;
+    u_short clocalport;
+};
+static struct LocatorSvcProxy locatorsvc_proxies[MAX_LOCATOR_PROXIES];
+static int num_locatorsvc_proxies= 0;
+static unsigned int next_locatorsvc_proxyid= 0;
+
+/* list of REST service listners */
+struct RESTSvcListener {
+    time_t expirytime;
+    unsigned int listenerid;
+    struct in_addr serveraddr;
+    u_short serverport;
+    struct in_addr localaddr;
+    u_short localport;
+    int sock;
+};
+static struct RESTSvcListener restsvc_listeners[MAX_REST_LISTENER];
+static int num_restsvc_listeners= 0;
+static unsigned int next_restsvc_listenerid= 0;
+
+/* list of REST service proxies */
+struct RESTSvcProxy {
+    unsigned int proxyid;
+    int clientsock;
+    int serversock;
+    struct in_addr serveraddr;
+    u_short serverport;
+    struct in_addr clientaddr;
+    u_short clientport;
+    struct in_addr slocaladdr;
+    u_short slocalport;
+    struct in_addr clocaladdr;
+    u_short clocalport;
+};
+static struct RESTSvcProxy restsvc_proxies[MAX_REST_PROXIES];
+static int num_restsvc_proxies= 0;
+static unsigned int next_restsvc_proxyid= 0;
+
+
 void inet_ntoa2(struct in_addr in, char* chr, int len) {
     char* from = inet_ntoa(in);
     strncpy(chr, from, len);
+}
+
+// Set socket options to receive TTL, TOS, receiving IP and interface for a socket.
+// Return 0 on errror.
+int enable_recvmsg_headers (int s, char *callername)
+{
+    int yes = 1;
+    #ifdef __FreeBSD__
+        if(setsockopt(s, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes))<0) {
+            fprintf(stderr,"IP_RECVTTL (%s): %s\n",callername,strerror(errno));
+            return 0;
+        };
+        if(setsockopt(s, IPPROTO_IP, IP_RECVTOS, &yes, sizeof(yes))<0) {
+            fprintf(stderr,"IP_RECVTOS (%s): %s\n",callername,strerror(errno));
+            return 0;
+        };
+        if(setsockopt(s, IPPROTO_IP, IP_RECVIF, &yes, sizeof(yes))<0) {
+            fprintf(stderr,"IP_RECVIF (%s): %s\n",callername,strerror(errno));
+            return 0;
+        };
+        if(setsockopt(s, IPPROTO_IP, IP_RECVDSTADDR, &yes, sizeof(yes))<0) {
+            fprintf(stderr,"IP_RECVDSTADDR (%s): %s\n",callername,strerror(errno));
+            return 0;
+        };
+    #else
+        if(setsockopt(s, SOL_IP, IP_RECVTTL, &yes, sizeof(yes))<0) {
+            fprintf(stderr,"IP_RECVTTL (%s): %s\n",callername,strerror(errno));
+            return 0;
+        };
+        if(setsockopt(s, SOL_IP, IP_RECVTOS, &yes, sizeof(yes))<0) {
+            fprintf(stderr,"IP_RECVTOS (%s): %s\n",callername,strerror(errno));
+            return 0;
+        };
+        if(setsockopt(s, SOL_IP, IP_PKTINFO, &yes, sizeof(yes))<0) {
+            fprintf(stderr,"IP_PKTINFO (%s): %s\n",callername,strerror(errno));
+            return 0;
+        };
+    #endif
+    return 1;
+}
+
+// Receive message on socket and return address info. Also check that
+// packet was received on a managed interface. to_port is passed in
+// for debug print info. Returns number of bytes received or <0 for error
+int recv_with_addrinfo (int s, void *buf, size_t buflen, struct Iface **iface_out,
+                        struct in_addr *from_inaddr_out, u_short *from_port_out,
+                        struct in_addr *to_inaddr_out, u_short to_port)
+{
+    struct in_addr from_inaddr;
+    struct in_addr to_inaddr;
+    u_short from_port;
+    struct sockaddr_in rcv_addr;
+    struct msghdr rcv_msg;
+    struct iovec iov;
+    iov.iov_base = buf;
+    iov.iov_len = buflen;
+    u_char pkt_infos[16384];
+    int len;
+
+    rcv_msg.msg_name = &rcv_addr;
+    rcv_msg.msg_namelen = sizeof(rcv_addr);
+    rcv_msg.msg_iov = &iov;
+    rcv_msg.msg_iovlen = 1;
+    rcv_msg.msg_control = pkt_infos;
+    rcv_msg.msg_controllen = sizeof(pkt_infos);
+
+    len = recvmsg(s,&rcv_msg,0);
+    if (len <= 0) return len;    /* ignore broken packets */
+
+    from_inaddr = rcv_addr.sin_addr;
+    from_port = ntohs(rcv_addr.sin_port);
+
+    /* Find the receiving interface and IP address */
+    struct cmsghdr *cmsg;
+    int rcv_ifindex = 0;
+    int foundRcvIf = 0;
+    int foundRcvIp = 0;
+    if (rcv_msg.msg_controllen > 0) {
+        for (cmsg=CMSG_FIRSTHDR(&rcv_msg);cmsg;cmsg=CMSG_NXTHDR(&rcv_msg,cmsg)) {
+            #ifdef __FreeBSD__
+                if (cmsg->cmsg_type==IP_RECVDSTADDR) {
+                    to_inaddr=*((struct in_addr *)CMSG_DATA(cmsg));
+                    foundRcvIp = 1;
+                }
+                if (cmsg->cmsg_type==IP_RECVIF) {
+                    rcv_ifindex=((struct sockaddr_dl *)CMSG_DATA(cmsg))->sdl_index;
+                    foundRcvIf = 1;
+                }
+            #else
+                if (cmsg->cmsg_type==IP_PKTINFO) {
+                    rcv_ifindex=((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_ifindex;
+                    foundRcvIf = 1;
+                    to_inaddr=((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_addr;
+                    foundRcvIp = 1;
+                }
+            #endif
+        }
+    }
+
+    if (!foundRcvIp) {
+        perror("Source IP not found on incoming packet\n");
+        return -2;
+    }
+    if (!foundRcvIf) {
+        perror("Interface not found on incoming packet\n");
+        return -2;
+    }
+
+    char from_addrstr[255];
+    inet_ntoa2(from_inaddr, from_addrstr, sizeof(from_addrstr));
+    char to_addrstr[255];
+    inet_ntoa2(to_inaddr, to_addrstr, sizeof(to_addrstr));
+    DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i)\n",
+        from_addrstr, from_port, to_addrstr, to_port,
+        rcv_ifindex, len
+    );
+
+    foundRcvIf = 0;
+    for (int iIf = 0; iIf < maxifs; iIf++) {
+        if (ifs[iIf].ifindex == rcv_ifindex) {
+            if (iface_out) *iface_out = &ifs[iIf];
+            foundRcvIf = 1;
+        }
+    }
+
+    if (!foundRcvIf) {
+        DPRINT("Not from managed iface\n\n");
+        return -3;
+    }
+
+    if (from_inaddr_out) *from_inaddr_out = from_inaddr;
+    if (from_port_out) *from_port_out = from_port;
+    if (to_inaddr_out) *to_inaddr_out = to_inaddr;
+
+    return len;
+}
+
+// Bind socket to 0.0.0.0:0 and return the local port number associated with
+// the socket or return 0 on error.
+u_short get_sock_local_port(int s, in_addr_t localip, char *callername)
+{
+    struct sockaddr_in bind_addr;
+    struct sockaddr_in local_addr;
+    socklen_t local_addr_size = sizeof(local_addr);
+
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = 0;
+    bind_addr.sin_addr.s_addr = localip;
+
+    if(bind(s, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        fprintf(stderr,"bind (%s): %s\n",callername,strerror(errno));
+        return 0;
+    }
+
+    if(getsockname(s, (struct sockaddr *)&local_addr, &local_addr_size)<0) {
+        fprintf(stderr,"getsockname (%s): %s\n",callername,strerror(errno));
+        return 0;
+    }
+    return ntohs(local_addr.sin_port);
+}
+
+int extract_address (char *str, char *prefix, char **addr_start_ptr, char **addr_end_ptr,
+                     struct in_addr *ipaddr, u_short *port)
+{
+    char *startptr = str;
+    char *termptr = NULL;
+    int prefixlen = strlen(prefix);
+    char addrstr[64];
+    int addrlen;
+
+    while (*startptr) {
+        if (!strncasecmp(startptr,prefix,prefixlen)) {
+            break;
+        }
+        startptr++;
+    }
+
+    if (!*startptr) {
+        return 0;
+    }
+
+    startptr += prefixlen;
+    termptr = strchr(startptr,'/');
+    if (!termptr) {
+        return 0;
+    }
+    addrlen = termptr-startptr;
+    if (addrlen>=sizeof(addrstr)) {
+        return 0;
+    }
+
+    *addr_start_ptr = startptr;
+    *addr_end_ptr = termptr;
+
+    memcpy(addrstr,startptr,addrlen);
+    addrstr[addrlen] = 0;
+    termptr = strchr(addrstr,':');
+    *port = 80;    // default if no port was found
+    if (termptr) {
+        *termptr = 0;
+        *port = atoi(termptr+1);
+    }
+    struct addrinfo hints;
+    struct addrinfo *results;
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(addrstr, NULL, &hints, &results) != 0) {
+        perror("getaddrinfo");
+        return 0;
+    }
+    *ipaddr = ((struct sockaddr_in*)(results->ai_addr))->sin_addr;
+    freeaddrinfo(results);
+    return 1;
+}
+
+u_short find_or_create_restsvc_listener(struct in_addr servertoaddr, u_short servertoport, struct in_addr listenaddr)
+{
+    char serveraddrStr[255];
+    char localaddrStr[255];
+
+    time_t now = time(NULL);
+    int i= 0;
+    // Look for an existing proxy for this destination host ip:port
+    while (i < num_restsvc_listeners) {
+        if (restsvc_listeners[i].expirytime < now) {
+            inet_ntoa2(restsvc_listeners[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+            inet_ntoa2(restsvc_listeners[i].localaddr, localaddrStr, sizeof(localaddrStr));
+            DPRINT("   _Expire REST_Svc listener [id=%u] for proxy to %s:%d on local address %s:%d. %d proxies left\n",
+                   restsvc_listeners[i].listenerid,
+                   serveraddrStr, restsvc_listeners[i].serverport,
+                   localaddrStr, restsvc_listeners[i].localport,
+                   num_restsvc_listeners-1
+            );
+            close(restsvc_listeners[i].sock);
+            memcpy(restsvc_listeners+i, restsvc_listeners+(--num_restsvc_listeners), sizeof(*restsvc_listeners));
+            continue;
+        }
+        if( (restsvc_listeners[i].serveraddr.s_addr == servertoaddr.s_addr) &&
+            (restsvc_listeners[i].serverport == servertoport) &&
+            (restsvc_listeners[i].localaddr.s_addr == listenaddr.s_addr)) {
+            inet_ntoa2(restsvc_listeners[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+            inet_ntoa2(restsvc_listeners[i].localaddr, localaddrStr, sizeof(localaddrStr));
+            DPRINT("   Found existing REST_Svc listener [id=%u] for proxy to %s:%d on local address %s:%d.\n",
+                   restsvc_listeners[i].listenerid,
+                   serveraddrStr, restsvc_listeners[i].serverport,
+                   localaddrStr, restsvc_listeners[i].localport
+            );
+            restsvc_listeners[i].expirytime = now+REST_LISTENER_EXPIRY;    //  Update expiry time
+            return restsvc_listeners[i].localport;
+        }
+        i++;
+    }
+
+    // Add new proxy because there is no existing match
+    if(num_restsvc_listeners == MAX_REST_LISTENER) {
+        DPRINT("Can't add new REST_Svc listener - maximum number of listeners reached\n\n");
+        return 0;
+    }
+
+    int newsock;
+    u_short localport;
+
+    if((newsock=socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+        perror("socket (REST_Svc listener)");
+        return 0;
+    };
+
+    if ((localport = get_sock_local_port(newsock, listenaddr.s_addr,"LocatorSvc listener")) == 0) {
+        close(newsock);
+        return 0;
+    }
+
+    if(listen(newsock, 3) < 0) {
+        perror("listen (REST_Svc listener)");
+        close(newsock);
+        return 0;
+    }
+
+    restsvc_listeners[num_restsvc_listeners].expirytime = now+REST_LISTENER_EXPIRY;
+    restsvc_listeners[num_restsvc_listeners].listenerid = next_restsvc_listenerid++;
+    restsvc_listeners[num_restsvc_listeners].serveraddr = servertoaddr;
+    restsvc_listeners[num_restsvc_listeners].serverport = servertoport;
+    restsvc_listeners[num_restsvc_listeners].sock = newsock;
+    restsvc_listeners[num_restsvc_listeners].localaddr = listenaddr;
+    restsvc_listeners[num_restsvc_listeners].localport = localport;
+    num_restsvc_listeners++;
+
+    inet_ntoa2(servertoaddr, serveraddrStr, sizeof(serveraddrStr));
+    inet_ntoa2(listenaddr, localaddrStr, sizeof(localaddrStr));
+    DPRINT("   Created REST_Svc listener [id=%u] for proxy to %s:%d on local address %s:%d. Total proxies: %d\n",
+           restsvc_listeners[num_restsvc_listeners-1].listenerid,
+           serveraddrStr, servertoport,
+           localaddrStr, localport, num_restsvc_listeners
+    );
+
+    return localport;
+}
+
+void handle_rest_services_accept (int listerneridx)
+{
+    int serversock;
+    int clientsock;
+    struct sockaddr_in clientaddr;
+    struct sockaddr_in serveraddr;
+    socklen_t clientaddrlen = sizeof(clientaddr);
+
+    char clientaddrStr[255];
+    char serveraddrStr[255];
+
+    if ((clientsock = accept(restsvc_listeners[listerneridx].sock, (struct sockaddr *)&clientaddr,
+                             &clientaddrlen)) < 0)
+    {
+        perror("accept (REST_Svc proxy)");
+        return;
+    }
+
+    int flags;
+    if ((flags = fcntl(clientsock, F_GETFL, 0)) < 0) {
+        flags = 0;
+    }
+    if (fcntl(clientsock, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        perror("accept (REST_Svc proxy)");
+    }
+
+    inet_ntoa2(clientaddr.sin_addr, clientaddrStr, sizeof(clientaddrStr));
+    DPRINT("REST_Svc proxy - accepted connection from client %s:%d\n",
+        clientaddrStr, clientaddr.sin_port
+    );
+
+    if (num_restsvc_proxies==MAX_REST_PROXIES) {
+        DPRINT("... closing connection. No free proxy slots\n");
+        close(clientsock);
+        return;
+    }
+
+    if ((serversock = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, IPPROTO_TCP)) < 0) {
+        perror("socket (REST_Svc proxy)");
+        close(clientsock);
+        return;
+    }
+
+    memset(&serveraddr, 0, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+    serveraddr.sin_port = htons(restsvc_listeners[listerneridx].serverport);
+    serveraddr.sin_addr = restsvc_listeners[listerneridx].serveraddr;
+    if (connect(serversock, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
+        if (errno==EINPROGRESS) {
+            // Give the connection 500ms time to complete
+            struct pollfd fds[1];
+            fds[0].fd = serversock;
+            fds[0].events = POLLOUT;
+            if (poll(fds,1,500)<1) {
+                perror("poll (REST_Svc proxy)");
+                close(serversock);
+                close(clientsock);
+                DPRINT("... closing connection. Connection timeout to peer\n");
+                return;
+            }
+            if (!(fds[0].revents & POLLOUT)) {
+                close(serversock);
+                close(clientsock);
+                DPRINT("... closing connection. Connection to peer not ready for writing\n");
+                return;
+            }
+
+        } else {
+            perror("connect (REST_Svc proxy)");
+            close(serversock);
+            close(clientsock);
+            DPRINT("... closing connection. Connection error to peer\n");
+            return;
+        }
+    }
+
+    // Get local addresses
+    struct sockaddr_in lserveraddr;
+    struct sockaddr_in lclientaddr;
+    socklen_t addrsize = sizeof(lserveraddr);
+
+    memset (&lserveraddr, 0, sizeof(lserveraddr));
+    if (getsockname(serversock, (struct sockaddr *)&lserveraddr, &addrsize) < 0) {
+        perror("getsockname (REST_Svc proxy lserveraddr)");
+    }
+
+    memset (&lclientaddr, 0, sizeof(lclientaddr));
+    if (getsockname(clientsock, (struct sockaddr *)&lclientaddr, &addrsize) < 0) {
+        perror("getsockname (REST_Svc proxy lclientaddr)");
+    }
+
+    // scavange old, closed proxy list entries
+    int i= 0;
+    while (i < num_restsvc_proxies) {
+        if (restsvc_proxies[i].clientsock < 0) {
+            inet_ntoa2(restsvc_proxies[i].clientaddr, clientaddrStr, sizeof(clientaddrStr));
+            inet_ntoa2(restsvc_proxies[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+            DPRINT("   _Scavange REST_Svc proxy [id=%u] for client %s:%d to server %s:%d. %d proxies left\n",
+                   restsvc_proxies[i].proxyid,
+                   clientaddrStr, restsvc_proxies[i].clientport,
+                   serveraddrStr, restsvc_proxies[i].serverport,
+                   num_restsvc_proxies-1
+            );
+            memcpy(restsvc_proxies+i, restsvc_proxies+(--num_restsvc_proxies), sizeof(*restsvc_proxies));
+            continue;
+        }
+        i++;
+    }
+
+    // add to proxy list
+    restsvc_proxies[num_restsvc_proxies].proxyid = next_restsvc_proxyid++;
+    restsvc_proxies[num_restsvc_proxies].clientsock = clientsock;
+    restsvc_proxies[num_restsvc_proxies].serversock = serversock;
+    restsvc_proxies[num_restsvc_proxies].serveraddr = restsvc_listeners[listerneridx].serveraddr;
+    restsvc_proxies[num_restsvc_proxies].serverport = restsvc_listeners[listerneridx].serverport;
+    restsvc_proxies[num_restsvc_proxies].clientaddr = clientaddr.sin_addr;
+    restsvc_proxies[num_restsvc_proxies].clientport = ntohs(clientaddr.sin_port);
+    restsvc_proxies[num_restsvc_proxies].slocaladdr = lserveraddr.sin_addr;
+    restsvc_proxies[num_restsvc_proxies].slocalport = ntohs(lserveraddr.sin_port);
+    restsvc_proxies[num_restsvc_proxies].clocaladdr = lclientaddr.sin_addr;
+    restsvc_proxies[num_restsvc_proxies].clocalport = ntohs(lclientaddr.sin_port);
+    num_restsvc_proxies++;
+
+    inet_ntoa2(clientaddr.sin_addr, clientaddrStr, sizeof(clientaddrStr));
+    inet_ntoa2(restsvc_listeners[listerneridx].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+    DPRINT("   Added LocatorSvc proxy [id=%u] for client %s:%d to server %s:%d. Total proxies: %d\n",
+           restsvc_proxies[num_restsvc_proxies-1].proxyid,
+           clientaddrStr, restsvc_proxies[num_restsvc_proxies-1].clientport,
+           serveraddrStr, restsvc_proxies[num_restsvc_proxies-1].serverport,
+           num_restsvc_proxies
+    );
+}
+
+void handle_restsvc_proxy_recv (int proxyidx, int socktype)
+{
+    int fromsock, tosock;
+    struct in_addr fromaddr;
+    struct in_addr fromlocaladdr;
+    struct in_addr toaddr;
+    struct in_addr tolocaladdr;
+    u_short fromport;
+    u_short fromlocalport;
+    u_short toport;
+    u_short tolocalport;
+
+    char toaddrStr[255];
+    char fromaddrStr[255];
+    char localaddrStr[255];
+
+    if (socktype==RESTSVC_CIENTSOCK) {
+        fromsock = restsvc_proxies[proxyidx].clientsock;
+        tosock = restsvc_proxies[proxyidx].serversock;
+        fromaddr = restsvc_proxies[proxyidx].clientaddr;
+        tolocaladdr = restsvc_proxies[proxyidx].clocaladdr;
+        toaddr = restsvc_proxies[proxyidx].serveraddr;
+        fromlocaladdr = restsvc_proxies[proxyidx].slocaladdr;
+        fromport = restsvc_proxies[proxyidx].clientport;
+        tolocalport = restsvc_proxies[proxyidx].clocalport;
+        toport = restsvc_proxies[proxyidx].serverport;
+        fromlocalport = restsvc_proxies[proxyidx].slocalport;
+    } else {
+        fromsock = restsvc_proxies[proxyidx].serversock;
+        tosock = restsvc_proxies[proxyidx].clientsock;
+        fromaddr = restsvc_proxies[proxyidx].serveraddr;
+        tolocaladdr = restsvc_proxies[proxyidx].slocaladdr;
+        toaddr = restsvc_proxies[proxyidx].clientaddr;
+        fromlocaladdr = restsvc_proxies[proxyidx].clocaladdr;
+        fromport = restsvc_proxies[proxyidx].serverport;
+        tolocalport = restsvc_proxies[proxyidx].slocalport;
+        toport = restsvc_proxies[proxyidx].clientport;
+        fromlocalport = restsvc_proxies[proxyidx].clocalport;
+    }
+
+    char buffer[32768];
+    int numread;
+    int numwritten;
+    numread = recv (fromsock, buffer, sizeof(buffer), 0);
+
+    inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
+    inet_ntoa2(tolocaladdr, localaddrStr, sizeof(localaddrStr));
+    DPRINT("<- TCP [ %s:%d -> %s:%d (len=%i)] to REST_Svc proxy [id=%u]\n",
+        fromaddrStr, fromport, localaddrStr, tolocalport,
+        numread, restsvc_proxies[proxyidx].proxyid
+    );
+
+    if (numread<=0) {
+        DPRINT((numread==0)?
+               "   %s connection gracefully closed. Shutting down REST_Svc proxy [id=%u].\n":
+               "   Error reading %s socket. Shutting down REST_Svc proxy [id=%u].\n\n",
+               socktype==RESTSVC_CIENTSOCK?"Client":"Server", restsvc_proxies[proxyidx].proxyid
+        );
+        close(restsvc_proxies[proxyidx].clientsock);
+        close(restsvc_proxies[proxyidx].serversock);
+        restsvc_proxies[proxyidx].clientsock = -1;
+        restsvc_proxies[proxyidx].serversock = -1;
+        return;
+    }
+
+    numwritten = send(tosock, buffer, numread, 0);
+    if (numwritten < 0) {
+        if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+            inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
+            DPRINT("   REST_Svc proxy [id=%u] would block sending to %s:%d. Retrying in %dms\n",
+                   restsvc_proxies[proxyidx].proxyid, toaddrStr, toport, BLOCK_RETRY_TIME);
+
+            struct pollfd fds[1];
+            fds[0].fd = tosock;
+            fds[0].events = POLLOUT;
+            poll(fds,1,BLOCK_RETRY_TIME);
+
+            numwritten = send(tosock, buffer, numread, 0);
+            if (numwritten < 0) {
+                perror("send (REST_Svc proxy retry)");
+                DPRINT("   REST_Svc proxy [id=%u] would block still block. Shutting down proxy\n",
+                       restsvc_proxies[proxyidx].proxyid);
+                close(restsvc_proxies[proxyidx].clientsock);
+                close(restsvc_proxies[proxyidx].serversock);
+                restsvc_proxies[proxyidx].clientsock = -1;
+                restsvc_proxies[proxyidx].serversock = -1;
+                return;
+            }
+        } else {
+            perror("send (REST_Svc proxy)");
+            inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
+            DPRINT("   REST_Svc proxy [id=%u] error sending to %s:%d. Shutting down proxy\n",
+                   restsvc_proxies[proxyidx].proxyid, toaddrStr, toport);
+            close(restsvc_proxies[proxyidx].clientsock);
+            close(restsvc_proxies[proxyidx].serversock);
+            restsvc_proxies[proxyidx].clientsock = -1;
+            restsvc_proxies[proxyidx].serversock = -1;
+            return;
+        }
+    }
+
+    inet_ntoa2(fromlocaladdr, localaddrStr, sizeof(localaddrStr));
+    inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
+    inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
+    DPRINT("-> TCP [ %s:%d -> %s:%d (len=%i)] for %s %s:%d via REST_Svc proxy [id=%u]\n\n",
+        localaddrStr, fromlocalport, toaddrStr, toport, numwritten,
+        socktype==RESTSVC_CIENTSOCK?"client":"server",
+        fromaddrStr, fromport, restsvc_proxies[proxyidx].proxyid
+    );
+}
+
+u_short find_or_create_locsvc_listener(struct in_addr servertoaddr, u_short servertoport, struct in_addr listenaddr)
+{
+    char serveraddrStr[255];
+    char localaddrStr[255];
+
+    time_t now = time(NULL);
+    int i= 0;
+    // Look for an existing proxy for this destination host ip:port
+    while (i < num_locatorsvc_listeners) {
+        if (locatorsvc_listeners[i].expirytime < now) {
+            inet_ntoa2(locatorsvc_listeners[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+            inet_ntoa2(locatorsvc_listeners[i].localaddr, localaddrStr, sizeof(localaddrStr));
+            DPRINT("   _Expire LocatorSvc listener [id=%u] for proxy to %s:%d on local address %s:%d. %d proxies left\n",
+                   locatorsvc_listeners[i].listenerid,
+                   serveraddrStr, locatorsvc_listeners[i].serverport,
+                   localaddrStr, locatorsvc_listeners[i].localport,
+                   num_locatorsvc_listeners-1
+            );
+            close(locatorsvc_listeners[i].sock);
+            memcpy(locatorsvc_listeners+i, locatorsvc_listeners+(--num_locatorsvc_listeners), sizeof(*locatorsvc_listeners));
+            continue;
+        }
+        if( (locatorsvc_listeners[i].serveraddr.s_addr == servertoaddr.s_addr) &&
+            (locatorsvc_listeners[i].serverport == servertoport) &&
+            (locatorsvc_listeners[i].localaddr.s_addr == listenaddr.s_addr)) {
+            inet_ntoa2(locatorsvc_listeners[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+            inet_ntoa2(locatorsvc_listeners[i].localaddr, localaddrStr, sizeof(localaddrStr));
+            DPRINT("   Found existing LocatorSvc listener [id=%u] for proxy to %s:%d on local address %s:%d.\n",
+                   locatorsvc_listeners[i].listenerid,
+                   serveraddrStr, locatorsvc_listeners[i].serverport,
+                   localaddrStr, locatorsvc_listeners[i].localport
+            );
+            locatorsvc_listeners[i].expirytime = now+LOCATOR_LISTENER_EXPIRY;    //  Update expiry time
+            return locatorsvc_listeners[i].localport;
+        }
+        i++;
+    }
+
+    // Add new proxy because there is no existing match
+    if(num_locatorsvc_listeners == MAX_LOCATOR_LISTENER) {
+        DPRINT("Can't add new LocatorSvc listener - maximum number of listeners reached\n\n");
+        return 0;
+    }
+
+    int newsock;
+    u_short localport;
+
+    if((newsock=socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+        perror("socket (LocatorSvc listener)");
+        return 0;
+    };
+
+    if ((localport = get_sock_local_port(newsock, listenaddr.s_addr,"LocatorSvc listener")) == 0) {
+        close(newsock);
+        return 0;
+    }
+
+    if(listen(newsock, 3) < 0) {
+        perror("listen (LocatorSvc listener)");
+        close(newsock);
+        return 0;
+    }
+
+    locatorsvc_listeners[num_locatorsvc_listeners].expirytime = now+LOCATOR_LISTENER_EXPIRY;
+    locatorsvc_listeners[num_locatorsvc_listeners].listenerid = next_locatorsvc_listenerid++;
+    locatorsvc_listeners[num_locatorsvc_listeners].serveraddr = servertoaddr;
+    locatorsvc_listeners[num_locatorsvc_listeners].serverport = servertoport;
+    locatorsvc_listeners[num_locatorsvc_listeners].sock = newsock;
+    locatorsvc_listeners[num_locatorsvc_listeners].localaddr = listenaddr;
+    locatorsvc_listeners[num_locatorsvc_listeners].localport = localport;
+    num_locatorsvc_listeners++;
+
+    inet_ntoa2(servertoaddr, serveraddrStr, sizeof(serveraddrStr));
+    inet_ntoa2(listenaddr, localaddrStr, sizeof(localaddrStr));
+    DPRINT("   Created LocatorSvc listener [id=%u] for proxy to %s:%d on local address %s:%d. Total proxies: %d\n",
+           locatorsvc_listeners[num_locatorsvc_listeners-1].listenerid,
+           serveraddrStr, servertoport,
+           localaddrStr, localport, num_locatorsvc_listeners
+    );
+
+    return localport;
+}
+
+void handle_loc_services_accept (int listerneridx)
+{
+    int serversock;
+    int clientsock;
+    struct sockaddr_in clientaddr;
+    struct sockaddr_in serveraddr;
+    socklen_t clientaddrlen = sizeof(clientaddr);
+
+    char clientaddrStr[255];
+    char serveraddrStr[255];
+
+    if ((clientsock = accept(locatorsvc_listeners[listerneridx].sock, (struct sockaddr *)&clientaddr,
+                             &clientaddrlen)) < 0)
+    {
+        perror("accept (LocatorSvc proxy)");
+        return;
+    }
+
+    int flags;
+    if ((flags = fcntl(clientsock, F_GETFL, 0)) < 0) {
+        flags = 0;
+    }
+    if (fcntl(clientsock, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        perror("accept (LocatorSvc proxy)");
+    }
+
+    inet_ntoa2(clientaddr.sin_addr, clientaddrStr, sizeof(clientaddrStr));
+    DPRINT("LocatorSvc proxy - accepted connection from client %s:%d\n",
+        clientaddrStr, clientaddr.sin_port
+    );
+
+    if (num_locatorsvc_proxies==MAX_LOCATOR_PROXIES) {
+        DPRINT("... closing connection. No free proxy slots\n");
+        close(clientsock);
+        return;
+    }
+
+    if ((serversock = socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK, IPPROTO_TCP)) < 0) {
+        perror("socket (LocatorSvc proxy)");
+        close(clientsock);
+        return;
+    }
+
+    memset(&serveraddr, 0, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+    serveraddr.sin_port = htons(locatorsvc_listeners[listerneridx].serverport);
+    serveraddr.sin_addr = locatorsvc_listeners[listerneridx].serveraddr;
+    if (connect(serversock, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0) {
+        if (errno==EINPROGRESS) {
+            // Give the connection 500ms time to complete
+            struct pollfd fds[1];
+            fds[0].fd = serversock;
+            fds[0].events = POLLOUT;
+            if (poll(fds,1,500)<1) {
+                perror("poll (LocatorSvc proxy)");
+                close(serversock);
+                close(clientsock);
+                DPRINT("... closing connection. Connection timeout to peer\n");
+                return;
+            }
+            if (!(fds[0].revents & POLLOUT)) {
+                close(serversock);
+                close(clientsock);
+                DPRINT("... closing connection. Connection to peer not ready for writing\n");
+                return;
+            }
+
+        } else {
+            perror("connect (LocatorSvc proxy)");
+            close(serversock);
+            close(clientsock);
+            DPRINT("... closing connection. Connection error to peer\n");
+            return;
+        }
+    }
+
+    // Get local addresses
+    struct sockaddr_in lserveraddr;
+    struct sockaddr_in lclientaddr;
+    socklen_t addrsize = sizeof(lserveraddr);
+
+    memset (&lserveraddr, 0, sizeof(lserveraddr));
+    if (getsockname(serversock, (struct sockaddr *)&lserveraddr, &addrsize) < 0) {
+        perror("getsockname (LocatorSvc proxy lserveraddr)");
+    }
+
+    memset (&lclientaddr, 0, sizeof(lclientaddr));
+    if (getsockname(clientsock, (struct sockaddr *)&lclientaddr, &addrsize) < 0) {
+        perror("getsockname (LocatorSvc proxy lclientaddr)");
+    }
+
+    // scavange old, closed proxy list entries
+    int i= 0;
+    while (i < num_locatorsvc_proxies) {
+        if (locatorsvc_proxies[i].clientsock < 0) {
+            inet_ntoa2(locatorsvc_proxies[i].clientaddr, clientaddrStr, sizeof(clientaddrStr));
+            inet_ntoa2(locatorsvc_proxies[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+            DPRINT("   _Scavange LocatorSvc proxy [id=%u] for client %s:%d to server %s:%d. %d proxies left\n",
+                   locatorsvc_proxies[i].proxyid,
+                   clientaddrStr, locatorsvc_proxies[i].clientport,
+                   serveraddrStr, locatorsvc_proxies[i].serverport,
+                   num_locatorsvc_proxies-1
+            );
+            memcpy(locatorsvc_proxies+i, locatorsvc_proxies+(--num_locatorsvc_proxies), sizeof(*locatorsvc_proxies));
+            continue;
+        }
+        i++;
+    }
+
+    // add to proxy list
+    locatorsvc_proxies[num_locatorsvc_proxies].proxyid = next_locatorsvc_proxyid++;
+    locatorsvc_proxies[num_locatorsvc_proxies].clientsock = clientsock;
+    locatorsvc_proxies[num_locatorsvc_proxies].serversock = serversock;
+    locatorsvc_proxies[num_locatorsvc_proxies].serveraddr = locatorsvc_listeners[listerneridx].serveraddr;
+    locatorsvc_proxies[num_locatorsvc_proxies].serverport = locatorsvc_listeners[listerneridx].serverport;
+    locatorsvc_proxies[num_locatorsvc_proxies].clientaddr = clientaddr.sin_addr;
+    locatorsvc_proxies[num_locatorsvc_proxies].clientport = ntohs(clientaddr.sin_port);
+    locatorsvc_proxies[num_locatorsvc_proxies].slocaladdr = lserveraddr.sin_addr;
+    locatorsvc_proxies[num_locatorsvc_proxies].slocalport = ntohs(lserveraddr.sin_port);
+    locatorsvc_proxies[num_locatorsvc_proxies].clocaladdr = lclientaddr.sin_addr;
+    locatorsvc_proxies[num_locatorsvc_proxies].clocalport = ntohs(lclientaddr.sin_port);
+    num_locatorsvc_proxies++;
+
+    inet_ntoa2(clientaddr.sin_addr, clientaddrStr, sizeof(clientaddrStr));
+    inet_ntoa2(locatorsvc_listeners[listerneridx].serveraddr, serveraddrStr, sizeof(serveraddrStr));
+    DPRINT("   Added LocatorSvc proxy [id=%u] for client %s:%d to server %s:%d. Total proxies: %d\n",
+           locatorsvc_proxies[num_locatorsvc_proxies-1].proxyid,
+           clientaddrStr, locatorsvc_proxies[num_locatorsvc_proxies-1].clientport,
+           serveraddrStr, locatorsvc_proxies[num_locatorsvc_proxies-1].serverport,
+           num_locatorsvc_proxies
+    );
+}
+
+void handle_locsvc_proxy_recv (int proxyidx, int socktype)
+{
+    int fromsock, tosock;
+    struct in_addr fromaddr;
+    struct in_addr fromlocaladdr;
+    struct in_addr toaddr;
+    struct in_addr tolocaladdr;
+    u_short fromport;
+    u_short fromlocalport;
+    u_short toport;
+    u_short tolocalport;
+
+    char toaddrStr[255];
+    char fromaddrStr[255];
+    char localaddrStr[255];
+
+    if (socktype==LOCSVC_CIENTSOCK) {
+        fromsock = locatorsvc_proxies[proxyidx].clientsock;
+        tosock = locatorsvc_proxies[proxyidx].serversock;
+        fromaddr = locatorsvc_proxies[proxyidx].clientaddr;
+        tolocaladdr = locatorsvc_proxies[proxyidx].clocaladdr;
+        toaddr = locatorsvc_proxies[proxyidx].serveraddr;
+        fromlocaladdr = locatorsvc_proxies[proxyidx].slocaladdr;
+        fromport = locatorsvc_proxies[proxyidx].clientport;
+        tolocalport = locatorsvc_proxies[proxyidx].clocalport;
+        toport = locatorsvc_proxies[proxyidx].serverport;
+        fromlocalport = locatorsvc_proxies[proxyidx].slocalport;
+    } else {
+        fromsock = locatorsvc_proxies[proxyidx].serversock;
+        tosock = locatorsvc_proxies[proxyidx].clientsock;
+        fromaddr = locatorsvc_proxies[proxyidx].serveraddr;
+        tolocaladdr = locatorsvc_proxies[proxyidx].slocaladdr;
+        toaddr = locatorsvc_proxies[proxyidx].clientaddr;
+        fromlocaladdr = locatorsvc_proxies[proxyidx].clocaladdr;
+        fromport = locatorsvc_proxies[proxyidx].serverport;
+        tolocalport = locatorsvc_proxies[proxyidx].slocalport;
+        toport = locatorsvc_proxies[proxyidx].clientport;
+        fromlocalport = locatorsvc_proxies[proxyidx].clocalport;
+    }
+
+    char buffer[32768];
+    int numread;
+    int numwritten;
+    numread = recv (fromsock, buffer, sizeof(buffer)-1, 0);
+
+    inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
+    inet_ntoa2(tolocaladdr, localaddrStr, sizeof(localaddrStr));
+    DPRINT("<- TCP [ %s:%d -> %s:%d (len=%i)] to LocatorSvc proxy [id=%u]\n",
+        fromaddrStr, fromport, localaddrStr, tolocalport,
+        numread, locatorsvc_proxies[proxyidx].proxyid
+    );
+
+    if (numread<=0) {
+        DPRINT((numread==0)?
+               "   %s connection gracefully closed. Shutting down LocatorSvc proxy [id=%u].\n":
+               "   Error reading %s socket. Shutting down LocatorSvc proxy [id=%u].\n\n",
+               socktype==LOCSVC_CIENTSOCK?"Client":"Server", locatorsvc_proxies[proxyidx].proxyid
+        );
+        close(locatorsvc_proxies[proxyidx].clientsock);
+        close(locatorsvc_proxies[proxyidx].serversock);
+        locatorsvc_proxies[proxyidx].clientsock = -1;
+        locatorsvc_proxies[proxyidx].serversock = -1;
+        return;
+    }
+
+    buffer[numread] = 0;
+
+    if (socktype==LOCSVC_SERVERSOCK) {
+        // Inspect payload and insert REST_Svc proxy if required
+        char *addrStartPtr;
+        char *addrEndPtr;
+        struct in_addr serverAddr;
+        u_short serverPort;
+
+        if (extract_address(buffer, APPLICATION_STRING_PREFIX, &addrStartPtr,
+                            &addrEndPtr, &serverAddr, &serverPort)) {
+             struct in_addr proxyAddress = locatorsvc_proxies[proxyidx].clocaladdr;
+            u_short proxyPort = find_or_create_restsvc_listener(serverAddr, serverPort, proxyAddress);
+            if (proxyPort) {
+                char addrstr[64];
+                char proxyAddrStr[255];
+                inet_ntoa2(proxyAddress, proxyAddrStr, sizeof(proxyAddrStr));
+                snprintf(addrstr, sizeof(addrstr), "%s:%d", proxyAddrStr, proxyPort);
+
+                int lengthChange = strlen(addrstr) - (addrEndPtr-addrStartPtr);
+                if ((numread+lengthChange) < sizeof(buffer)) {
+                    memmove(addrEndPtr+lengthChange, addrEndPtr, buffer + numread + 1 - addrEndPtr);
+                    memcpy(addrStartPtr, addrstr, strlen(addrstr));
+                }
+            } else {
+                DPRINT("Could not find a free REST services proxy slot - sending unmodified response\n\n");
+            }
+        }
+    }
+
+    numwritten = send(tosock, buffer, numread, 0);
+    if (numwritten < 0) {
+        if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+            inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
+            DPRINT("   LocatorSvc proxy [id=%u] would block sending to %s:%d. Retrying in %dms\n",
+                   locatorsvc_proxies[proxyidx].proxyid, toaddrStr, toport, BLOCK_RETRY_TIME);
+
+            struct pollfd fds[1];
+            fds[0].fd = tosock;
+            fds[0].events = POLLOUT;
+            poll(fds,1,BLOCK_RETRY_TIME);
+
+            numwritten = send(tosock, buffer, numread, 0);
+            if (numwritten < 0) {
+                perror("send (LocatorSvc proxy retry)");
+                DPRINT("   LocatorSvc proxy [id=%u] would block still block. Shutting down proxy\n",
+                       locatorsvc_proxies[proxyidx].proxyid);
+                close(locatorsvc_proxies[proxyidx].clientsock);
+                close(locatorsvc_proxies[proxyidx].serversock);
+                locatorsvc_proxies[proxyidx].clientsock = -1;
+                locatorsvc_proxies[proxyidx].serversock = -1;
+                return;
+            }
+        } else {
+            perror("send (LocatorSvc proxy)");
+            inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
+            DPRINT("   LocatorSvc proxy [id=%u] error sending to %s:%d. Shutting down proxy\n",
+                   locatorsvc_proxies[proxyidx].proxyid, toaddrStr, toport);
+            close(locatorsvc_proxies[proxyidx].clientsock);
+            close(locatorsvc_proxies[proxyidx].serversock);
+            locatorsvc_proxies[proxyidx].clientsock = -1;
+            locatorsvc_proxies[proxyidx].serversock = -1;
+            return;
+        }
+    }
+
+    inet_ntoa2(fromlocaladdr, localaddrStr, sizeof(localaddrStr));
+    inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
+    inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
+    DPRINT("-> TCP [ %s:%d -> %s:%d (len=%i)] for %s %s:%d via LocatorSvc proxy [id=%u]\n\n",
+        localaddrStr, fromlocalport, toaddrStr, toport, numwritten,
+        socktype==LOCSVC_CIENTSOCK?"client":"server",
+        fromaddrStr, fromport, locatorsvc_proxies[proxyidx].proxyid
+    );
+}
+
+// Find the M-SEARCH request proxy for a given client and return the UDP port
+// number on which the proxy listens. Return 0 if no proxy was found an a new
+// one could not be created. Also expire old proxies that have not been used.
+u_short find_or_create_msearch_proxy(struct in_addr clientfromaddr, u_short clientfromport, struct Iface* iface) {
+    time_t now = time(NULL);
+    int i= 0;
+    // Look for an existing proxy for this source host ip:port
+    while (i < num_msearch_proxies) {
+        if (msearch_proxies[i].expirytime < now) {
+            char clienthostStr[255];
+            inet_ntoa2(msearch_proxies[i].clienthost, clienthostStr, sizeof(clienthostStr));
+            DPRINT("   _Expire M-SEARCH proxy [id=%u] for %s:%d on local port %d. %d proxies left\n",
+                   msearch_proxies[i].proxyid, clienthostStr,
+                   msearch_proxies[i].clientport, msearch_proxies[i].localport,
+                   num_msearch_proxies-1
+            );
+            close(msearch_proxies[i].sock);
+            memcpy(msearch_proxies+i, msearch_proxies+(--num_msearch_proxies), sizeof(*msearch_proxies));
+            continue;
+        }
+        if( (msearch_proxies[i].clienthost.s_addr == clientfromaddr.s_addr) &&
+            (msearch_proxies[i].clientport == clientfromport) ) {
+            char clienthostStr[255];
+            inet_ntoa2(msearch_proxies[i].clienthost, clienthostStr, sizeof(clienthostStr));
+            DPRINT("   Found existing M-SEARCH proxy [id=%u] for %s:%d on local port %d.\n",
+                   msearch_proxies[i].proxyid, clienthostStr,
+                   msearch_proxies[i].clientport, msearch_proxies[i].localport
+            );
+            msearch_proxies[i].expirytime = now+10;    //  Update expiry time
+            return msearch_proxies[i].localport;
+        }
+        i++;
+    }
+
+    // Add new proxy because there is no existing match
+    if(num_msearch_proxies == MAX_MSEARCH_PROXY) {
+        DPRINT("Can't add new M-SEARCH proxy - maximum number of proxies reached\n\n");
+        return 0;
+    }
+
+    int newsock;
+    u_short localport;
+
+    if((newsock=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP)) < 0) {
+        perror("socket (M-SEARCH proxy)");
+        return 0;
+    };
+
+    if(!enable_recvmsg_headers(newsock, "M-SEARCH proxy")) {
+        close(newsock);
+        return 0;
+    }
+
+    localport = get_sock_local_port(newsock, INADDR_ANY, "M-SEARCH proxy");
+    if(!localport) {
+        close(newsock);
+        return 0;
+    }
+
+    msearch_proxies[num_msearch_proxies].expirytime = now+10;    //  Expire in 10 seconds
+    msearch_proxies[num_msearch_proxies].proxyid = next_msearch_proxyid++;
+    msearch_proxies[num_msearch_proxies].clienthost = clientfromaddr;
+    msearch_proxies[num_msearch_proxies].clientport = clientfromport;
+    msearch_proxies[num_msearch_proxies].sock = newsock;
+    msearch_proxies[num_msearch_proxies].clientiface= iface;
+    msearch_proxies[num_msearch_proxies].localport = localport;
+    num_msearch_proxies++;
+
+    char clientfromaddrStr[255];
+    inet_ntoa2(clientfromaddr, clientfromaddrStr, sizeof(clientfromaddrStr));
+    DPRINT("   Created M-SEARCH proxy [id=%u] for %s:%d on local port %d. Total proxies: %d\n",
+           msearch_proxies[num_msearch_proxies-1].proxyid, clientfromaddrStr, clientfromport, localport, num_msearch_proxies
+    );
+
+    return localport;
+}
+
+void handle_msearch_proxy_recv (int proxyidx)
+{
+    struct Iface* iface = msearch_proxies[proxyidx].clientiface;
+    int len = recv_with_addrinfo(msearch_proxies[proxyidx].sock, gram+HEADER_LEN,
+                                 sizeof(gram)-HEADER_LEN-1, NULL,
+                                 NULL, NULL, NULL, msearch_proxies[proxyidx].localport);
+    if (len <= 0) return;    /* ignore broken packets */
+    gram[HEADER_LEN + len] = 0;
+
+    char *addrStartPtr;
+    char *addrEndPtr;
+    struct in_addr serverAddr;
+    u_short serverPort;
+
+    if (extract_address(gram+HEADER_LEN, LOCATION_STRING_PREFIX, &addrStartPtr,
+                        &addrEndPtr, &serverAddr, &serverPort)) {
+        struct in_addr proxyAddress = iface->ifaddr;
+        u_short proxyPort = find_or_create_locsvc_listener(serverAddr, serverPort, proxyAddress);
+        if (proxyPort) {
+            char addrstr[64];
+            char proxyAddrStr[255];
+            inet_ntoa2(proxyAddress, proxyAddrStr, sizeof(proxyAddrStr));
+            snprintf(addrstr, sizeof(addrstr), "%s:%d", proxyAddrStr, proxyPort);
+
+            int lengthChange = strlen(addrstr) - (addrEndPtr-addrStartPtr);
+            if ((len+lengthChange) < (sizeof(gram)-HEADER_LEN)) {
+                memmove(addrEndPtr+lengthChange, addrEndPtr, (char*)gram + HEADER_LEN + len + 1 - addrEndPtr);
+                memcpy(addrStartPtr, addrstr, strlen(addrstr));
+            }
+        } else {
+            DPRINT("Could not find a free Locator services proxy slot - sending unmodified response\n\n");
+        }
+    }
+
+    struct in_addr fromAddress = iface->ifaddr;
+    u_short fromPort = msearch_proxies[proxyidx].localport;
+    struct in_addr toAddress = msearch_proxies[proxyidx].clienthost;
+    u_short toPort = msearch_proxies[proxyidx].clientport;
+
+    char fromAddressStr[255];
+    inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
+    char toAddressStr[255];
+    inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
+    DPRINT (
+        "-> [ %s:%d -> %s:%d (iface=%d len=%i)] m-search proxy [id=%u] reply\n\n",
+        fromAddressStr, fromPort, toAddressStr, toPort,
+        iface->ifindex, len, msearch_proxies[proxyidx].proxyid
+    );
+
+    gram[1] = 0;    // rcv_tos
+    gram[8] = 16;   // rcv_ttl;
+    memcpy(gram+12, &fromAddress.s_addr, 4);
+    memcpy(gram+16, &toAddress.s_addr, 4);
+    *(u_short*)(gram+20)=htons(fromPort);
+    *(u_short*)(gram+22)=htons(toPort);
+    #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
+    *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
+    *(u_short*)(gram+2)=HEADER_LEN + len;
+    #else
+    *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
+    *(u_short*)(gram+2)=htons(HEADER_LEN + len);
+    #endif
+    struct sockaddr_in sendAddr;
+    sendAddr.sin_family = AF_INET;
+    sendAddr.sin_port = htons(toPort);
+    sendAddr.sin_addr = toAddress;
+
+    if (sendto(
+        iface->raw_socket,
+        &gram,
+        HEADER_LEN+len,
+        0,
+        (struct sockaddr*)&sendAddr,
+        sizeof(sendAddr)
+    ) < 0) {
+        perror("sendto");
+    }
+}
+
+void service_proxy_messages (int main_rcv_sock)
+{
+    while (1) {
+        // Poll for any sockets with pending operations (read/close)
+        // Important - sockets are serviced in the order they are added to the poll
+        // list. REST and Locator service proxies MUST handled before any other sockets
+        // to avoid corrupting data structures when removing closed proxy entries
+        struct pollfd fds[MAX_PROXY_SOCKETS+1];
+        int proxy_array_idx[MAX_PROXY_SOCKETS+1];
+        char proxy_socket_type[MAX_PROXY_SOCKETS+1];
+        int total_fds= 0;
+        int i;
+
+        memset(fds, 0, sizeof(fds));
+
+        for (int i=0;i<num_restsvc_proxies;i++) {
+            fds[total_fds].fd = restsvc_proxies[i].clientsock;
+            fds[total_fds].events = POLLIN;
+            proxy_array_idx[total_fds] = i;
+            proxy_socket_type[total_fds] = RESTSVC_CIENTSOCK;
+            total_fds++;
+            fds[total_fds].fd = restsvc_proxies[i].serversock;
+            fds[total_fds].events = POLLIN;
+            proxy_array_idx[total_fds] = i;
+            proxy_socket_type[total_fds] = RESTSVC_SERVERSOCK;
+            total_fds++;
+        }
+
+        for (int i=0;i<num_locatorsvc_proxies;i++) {
+            fds[total_fds].fd = locatorsvc_proxies[i].clientsock;
+            fds[total_fds].events = POLLIN;
+            proxy_array_idx[total_fds] = i;
+            proxy_socket_type[total_fds] = LOCSVC_CIENTSOCK;
+            total_fds++;
+            fds[total_fds].fd = locatorsvc_proxies[i].serversock;
+            fds[total_fds].events = POLLIN;
+            proxy_array_idx[total_fds] = i;
+            proxy_socket_type[total_fds] = LOCSVC_SERVERSOCK;
+            total_fds++;
+        }
+
+        for (int i=0;i<num_restsvc_listeners;i++) {
+            fds[total_fds].fd = restsvc_listeners[i].sock;
+            fds[total_fds].events = POLLIN;
+            proxy_array_idx[total_fds] = i;
+            proxy_socket_type[total_fds] = RESTSVC_LISTENER;
+            total_fds++;
+        }
+
+        for (int i=0;i<num_locatorsvc_listeners;i++) {
+            fds[total_fds].fd = locatorsvc_listeners[i].sock;
+            fds[total_fds].events = POLLIN;
+            proxy_array_idx[total_fds] = i;
+            proxy_socket_type[total_fds] = LOCSVC_LISTENER;
+            total_fds++;
+        }
+        for (int i=0;i<num_msearch_proxies;i++) {
+            fds[total_fds].fd = msearch_proxies[i].sock;
+            fds[total_fds].events = POLLIN;
+            proxy_array_idx[total_fds] = i;
+            proxy_socket_type[total_fds] = MSEARCH_SOCKET;
+            total_fds++;
+        }
+
+        // Main socket should be the last element in the list
+        fds[total_fds].fd = main_rcv_sock;
+        fds[total_fds].events = POLLIN;
+        proxy_array_idx[total_fds] = 0;
+        proxy_socket_type[total_fds] = MAIN_SOCKET;
+        total_fds++;
+
+        // Poll for any sockets with data to read
+        if (poll(fds, total_fds, -1) < 0) {
+            perror("poll\n");
+            continue;
+        }
+
+        for (i=0;i<=total_fds;i++) {
+            // Skip socket if there is no data ready to read
+            if ( !(fds[i].revents & POLLIN) ) continue;
+
+            switch (proxy_socket_type[i]) {
+                case MAIN_SOCKET:
+                        return;
+
+                case MSEARCH_SOCKET:
+                        handle_msearch_proxy_recv(proxy_array_idx[i]);
+                        break;
+
+                case LOCSVC_LISTENER:
+                        handle_loc_services_accept(proxy_array_idx[i]);
+                        break;
+
+                case LOCSVC_CIENTSOCK:
+                case LOCSVC_SERVERSOCK:
+                        handle_locsvc_proxy_recv(proxy_array_idx[i], proxy_socket_type[i]);
+                        break;
+
+                case RESTSVC_LISTENER:
+                        handle_rest_services_accept(proxy_array_idx[i]);
+                        break;
+
+                case RESTSVC_CIENTSOCK:
+                case RESTSVC_SERVERSOCK:
+                        handle_restsvc_proxy_recv(proxy_array_idx[i], proxy_socket_type[i]);
+                        break;
+            }
+        }
+    }
 }
 
 void sig_term_handler(int signum, siginfo_t *info, void *ptr)
@@ -119,122 +1382,6 @@ void catch_sigterm()
 
     sigaction(SIGTERM, &_sigact, NULL);
 }
-
-u_short find_or_create_proxy(struct in_addr origFromAddress, u_short origFromPort, struct Iface* iface) {
-    // Find a proxy port to receive replies to the multicast request - return 0 on error
-    time_t now = time(NULL);
-    int iProxy = 0;
-
-    // Look for an existing proxy for this source host ip:port
-    while (iProxy < numproxies) {
-        if (proxysocks[iProxy].expirytime < now) {
-            char clienthostStr[255];
-            inet_ntoa2(proxysocks[iProxy].clienthost, clienthostStr, sizeof(clienthostStr));
-            DPRINT("   _Expire proxy [id=%u] for %s:%d on local port %d. %d proxies left\n",
-                   proxysocks[iProxy].proxyid, clienthostStr,
-                   proxysocks[iProxy].clientport, proxysocks[iProxy].localport,
-                   numproxies-1
-            );
-            close(proxysocks[iProxy].sock);
-            memcpy(proxysocks+iProxy, proxysocks+(--numproxies), sizeof(*proxysocks));
-            continue;
-        }
-        if( (proxysocks[iProxy].clienthost.s_addr == origFromAddress.s_addr) &&
-            (proxysocks[iProxy].clientport == origFromPort) ) {
-            char clienthostStr[255];
-            inet_ntoa2(proxysocks[iProxy].clienthost, clienthostStr, sizeof(clienthostStr));
-            DPRINT("   Found existing proxy [id=%u] for %s:%d on local port %d.\n",
-                   proxysocks[iProxy].proxyid, clienthostStr,
-                   proxysocks[iProxy].clientport, proxysocks[iProxy].localport
-            );
-            proxysocks[numproxies].expirytime = now+10;    //  Update expiry time
-            return proxysocks[iProxy].localport;
-        }
-        iProxy++;
-    }
-
-    // Add new proxy because there is no existing match
-    if(numproxies == MAXPROXYSOCK) {
-        DPRINT("Can't add new proxy - maximum number of proxies reached\n\n");
-        return 0;
-    }
-
-    int newsock;
-    struct sockaddr_in bind_addr;
-    struct sockaddr_in local_addr;
-    socklen_t local_addr_size = sizeof(local_addr);
-    u_short localport;
-
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = 0;
-    bind_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if((newsock=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP)) < 0) {
-        perror("socket[proxy]");
-        return 0;
-    };
-
-    int yes = 1;
-    #ifdef __FreeBSD__
-        if(setsockopt(newsock, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes))<0) {
-            perror("IP_RECVTTL on proxy");
-            return 0;
-        };
-        if(setsockopt(newsock, IPPROTO_IP, IP_RECVTOS, &yes, sizeof(yes))<0) {
-            perror("IP_RECVTOS on proxy");
-            return 0;
-        };
-        if(setsockopt(newsock, IPPROTO_IP, IP_RECVIF, &yes, sizeof(yes))<0) {
-            perror("IP_RECVIF on proxy");
-            return 0;
-        };
-        if(setsockopt(newsock, IPPROTO_IP, IP_RECVDSTADDR, &yes, sizeof(yes))<0) {
-            perror("IP_RECVDSTADDR on proxy");
-            return 0;
-        };
-    #else
-        if(setsockopt(newsock, SOL_IP, IP_RECVTTL, &yes, sizeof(yes))<0) {
-            perror("IP_RECVTTL on proxy");
-            return 0;
-        };
-        if(setsockopt(newsock, SOL_IP, IP_RECVTOS, &yes, sizeof(yes))<0) {
-            perror("IP_RECVTOS on proxy");
-            return 0;
-        };
-        if(setsockopt(newsock, SOL_IP, IP_PKTINFO, &yes, sizeof(yes))<0) {
-            perror("IP_PKTINFO on proxy");
-            return 0;
-        };
-    #endif
-
-    if(bind(newsock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        perror("bind[proxy]");
-        return 0;
-    }
-
-    if(getsockname(newsock, (struct sockaddr *)&local_addr, &local_addr_size)<0) {
-        perror("getsockname[proxy]");
-        return 0;
-    }
-    localport = ntohs(local_addr.sin_port);
-
-    proxysocks[numproxies].expirytime = now+10;    //  Expire in 10 seconds
-    proxysocks[iProxy].proxyid = nextproxyid++;
-    proxysocks[numproxies].clientiface = iface;
-    proxysocks[numproxies].clienthost = origFromAddress;
-    proxysocks[numproxies].clientport = origFromPort;
-    proxysocks[numproxies].sock = newsock;
-    proxysocks[numproxies].localport = localport;
-    numproxies++;
-    
-    char origFromAddressStr[255];
-    inet_ntoa2(origFromAddress, origFromAddressStr, sizeof(origFromAddressStr));
-    DPRINT("   Created proxy [id=%u] for %s:%d on local port %d. Total proxies: %d\n",
-           proxysocks[iProxy].proxyid, origFromAddressStr, origFromPort, localport, numproxies
-    );
-
-    return localport;
- }
 
 void display_usage(FILE *stream, const char *arg0) {
     fprintf(stream, "usage: %s [--id ID] [--port udp-port]\n"
@@ -319,7 +1466,7 @@ int main(int argc,char **argv) {
     struct msghdr rcv_msg;
     struct iovec iov;
     iov.iov_base = gram + HEADER_LEN;
-    iov.iov_len = 4006 - HEADER_LEN - 1;
+    iov.iov_len = sizeof(gram) - HEADER_LEN - 1;
     u_char pkt_infos[16384];
     rcv_msg.msg_name = &rcv_addr;
     rcv_msg.msg_namelen = sizeof(rcv_addr);
@@ -328,7 +1475,7 @@ int main(int argc,char **argv) {
     rcv_msg.msg_control = pkt_infos;
     rcv_msg.msg_controllen = sizeof(pkt_infos);
     static char pidfile[128];
-   
+
     int child_pid;
 #ifndef HAVE_ARC4RANDOM
 srandom(time(NULL) & getpid());
@@ -344,6 +1491,7 @@ srandom(time(NULL) & getpid());
     int i;
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i],"-d") == 0) {
+            DPRINT ("udpbroadcastrelay v1.1.01 built on " __DATE__ " " __TIME__ "\n");
             DPRINT ("Debugging Mode enabled\n");
             debug = 1;
         }
@@ -395,7 +1543,7 @@ srandom(time(NULL) & getpid());
         }
         else if (strcmp(argv[i],"--pid") == 0) {
             i++;
-            usr_pid = argv[i];            
+            usr_pid = argv[i];
         }
         else if (strcmp(argv[i],"--multicast") == 0) {
             if (multicastAddrsNum >= MAXMULTICAST) {
@@ -459,7 +1607,6 @@ srandom(time(NULL) & getpid());
 
 
     /* For each interface on the command line */
-    int maxifs = 0;
     for (int i = 0; i < interfaceNamesNum; i++) {
         struct Iface* iface = &ifs[maxifs];
 
@@ -470,7 +1617,7 @@ srandom(time(NULL) & getpid());
         {
             #ifdef ___APPLE__
                 /*
-                TODO: Supposedly this works for all OS, including non-Apple, 
+                TODO: Supposedly this works for all OS, including non-Apple,
                 and could replace the code below
                 */
                 iface->ifindex = if_nametoindex(interfaceNames[i]);
@@ -689,345 +1836,271 @@ srandom(time(NULL) & getpid());
 
     DPRINT("Done Initializing\n\n");
     sprintf(pidfile,"/var/run/udpbroadcastrelay_%d.pid",id);
-    if ((pidfp = fopen(pidfile, "w")) != NULL) {                 
+    if ((pidfp = fopen(pidfile, "w")) != NULL) {
     fprintf(pidfp, "%d\n", child_pid);
     fclose(pidfp);
     strcpy(g_pidfile,pidfile);
-    }     
+    }
     /* Fork to background */
     if (! debug) {
         if (forking && (child_pid=fork())) {
             sprintf(pidfile,"/var/run/udpbroadcastrelay_%d.pid",id);
-            if ((pidfp = fopen(pidfile, "w")) != NULL) {                 
+            if ((pidfp = fopen(pidfile, "w")) != NULL) {
             fprintf(pidfp, "%d\n", child_pid);
             fclose(pidfp);
             strcpy(g_pidfile,pidfile);
-            }
-        
+        }
+
         exit(0);
         fclose(stdin);
         fclose(stdout);
         fclose(stderr);
         }
     }
-    
 
     for (;;) /* endless loop */
     {
         catch_sigterm();
 
-        struct pollfd fds[MAXPROXYSOCK+1];
-        memset(fds, 0, sizeof(fds));
-        for (int sockidx=0;sockidx<numproxies;sockidx++) {
-            fds[sockidx].fd = proxysocks[sockidx].sock;
-            fds[sockidx].events = POLLIN;
-        }
-        fds[numproxies].fd = rcv;
-        fds[numproxies].events = POLLIN;
+        // Wait for message on main receive socket while servicing proxy connections
+        service_proxy_messages(rcv);
 
-        // Poll for any sockets with data to read
-        if (poll(fds, numproxies+1, -1) < 0) {
-            perror("poll\n");
+        /* Receive a broadcast packet */
+        int len = recvmsg(rcv,&rcv_msg,0);
+        if (len <= 0) continue;    /* ignore broken packets */
+
+        /* Find the ToS, ttl and the receiving interface */
+        struct cmsghdr *cmsg;
+        int rcv_ttl = 0;
+        int rcv_tos = 0;
+        int found_rcv_tos = 0;
+        int rcv_ifindex = 0;
+        struct in_addr rcv_inaddr;
+        int foundRcvIf = 0;
+        int foundRcvIp = 0;
+        if (rcv_msg.msg_controllen > 0) {
+            for (cmsg=CMSG_FIRSTHDR(&rcv_msg);cmsg;cmsg=CMSG_NXTHDR(&rcv_msg,cmsg)) {
+                #ifdef __FreeBSD__
+                    if (cmsg->cmsg_type==IP_RECVTTL) {
+                        rcv_ttl = *(int *)CMSG_DATA(cmsg);
+                    }
+                    if (cmsg->cmsg_type==IP_RECVTOS) {
+                        rcv_tos = *(int *)CMSG_DATA(cmsg);
+                        found_rcv_tos = 1;
+                    }
+                    if (cmsg->cmsg_type==IP_RECVDSTADDR) {
+                        rcv_inaddr=*((struct in_addr *)CMSG_DATA(cmsg));
+                        foundRcvIp = 1;
+                    }
+                    if (cmsg->cmsg_type==IP_RECVIF) {
+                        rcv_ifindex=((struct sockaddr_dl *)CMSG_DATA(cmsg))->sdl_index;
+                        foundRcvIf = 1;
+                    }
+                #else
+                    if (cmsg->cmsg_type==IP_TTL) {
+                        rcv_ttl = *(int *)CMSG_DATA(cmsg);
+                    }
+                    if (cmsg->cmsg_type==IP_TOS) {
+                        rcv_tos = *(int *)CMSG_DATA(cmsg);
+                        found_rcv_tos = 1;
+                    }
+                    if (cmsg->cmsg_type==IP_PKTINFO) {
+                        rcv_ifindex=((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_ifindex;
+                        foundRcvIf = 1;
+                        rcv_inaddr=((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_addr;
+                        foundRcvIp = 1;
+                    }
+                #endif
+            }
+        }
+
+        if (!foundRcvIp) {
+            perror("Source IP not found on incoming packet\n");
+            continue;
+        }
+        if (!foundRcvIf) {
+            perror("Interface not found on incoming packet\n");
+            continue;
+        }
+        if (!rcv_ttl) {
+            perror("TTL not found on incoming packet\n");
+            continue;
+        }
+        if (!found_rcv_tos) {
+            if (use_ttl_id) {
+                /*
+                 * If we're not using DSCP as the tag field then
+                 * this error doesn't matter but print the warning
+                 * anyway.
+                 */
+                perror("Warning : ToS not found on incoming packet - continuing processing\n");
+            } else {
+                perror("ToS not found on incoming packet\n");
+                continue;
+            }
+        }
+
+        struct Iface* fromIface = NULL;
+        for (int iIf = 0; iIf < maxifs; iIf++) {
+            if (ifs[iIf].ifindex == rcv_ifindex) {
+                fromIface = &ifs[iIf];
+            }
+        }
+
+        struct in_addr origFromAddress = rcv_addr.sin_addr;
+        u_short origFromPort = ntohs(rcv_addr.sin_port);
+        struct in_addr origToAddress = rcv_inaddr;
+        u_short origToPort = port;
+        u_short proxyport;
+
+        gram[HEADER_LEN + len] = 0;
+
+        char origFromAddressStr[255];
+        inet_ntoa2(origFromAddress, origFromAddressStr, sizeof(origFromAddressStr));
+        char origToAddressStr[255];
+        inet_ntoa2(origToAddress, origToAddressStr, sizeof(origToAddressStr));
+        DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i tos=0x%02x DSCP=%i ttl=%i)\n",
+            origFromAddressStr, origFromPort,
+            origToAddressStr, origToPort,
+            rcv_ifindex, len, rcv_tos,
+            rcv_tos >> 2, rcv_ttl
+        );
+
+        if (use_ttl_id) {
+            if (rcv_ttl == ttl) {
+                DPRINT("IP TTL (%i) matches ID (%i) + %i. Packet Ignored.\n\n",
+                       rcv_ttl, id, TTL_ID_OFFSET);
+                continue;
+            }
+        } else {
+            if ((rcv_tos & 0xfc) == tos) {
+                DPRINT("IP DSCP (%i) matches ID. IP ToS 0x%02x. Packet Ignored.\n\n",
+                       tos >> 2, tos);
+                continue;
+            }
+        }
+
+        if (!fromIface) {
+            DPRINT("Not from managed iface\n\n");
             continue;
         }
 
-        // Iterate through proxy sockets and the main receive socket
-        for (int sockidx=0;sockidx<=numproxies;sockidx++) {
-            // Skip socket if there is no data ready to read
-            if ( !(fds[sockidx].revents & POLLIN) ) continue;
-			
-            /* Receive a broadcast packet or response sent to proxy socket */
-            int len = recvmsg(fds[sockidx].fd,&rcv_msg,0);
-            if (len <= 0) continue;    /* ignore broken packets */
-    
-            /* Find the ToS, ttl and the receiving interface */
-            struct cmsghdr *cmsg;
-            int rcv_ttl = 0;
-            int rcv_tos = 0;
-            int found_rcv_tos = 0;
-            int rcv_ifindex = 0;
-            struct in_addr rcv_inaddr;
-            int foundRcvIf = 0;
-            int foundRcvIp = 0;
-            if (rcv_msg.msg_controllen > 0) {
-                for (cmsg=CMSG_FIRSTHDR(&rcv_msg);cmsg;cmsg=CMSG_NXTHDR(&rcv_msg,cmsg)) {
-                    #ifdef __FreeBSD__
-                        if (cmsg->cmsg_type==IP_RECVTTL) {
-                            rcv_ttl = *(int *)CMSG_DATA(cmsg);
-                        }
-                        if (cmsg->cmsg_type==IP_RECVTOS) {
-                            rcv_tos = *(int *)CMSG_DATA(cmsg);
-                            found_rcv_tos = 1;
-                        }
-                        if (cmsg->cmsg_type==IP_RECVDSTADDR) {
-                            rcv_inaddr=*((struct in_addr *)CMSG_DATA(cmsg));
-                            foundRcvIp = 1;
-                        }
-                        if (cmsg->cmsg_type==IP_RECVIF) {
-                            rcv_ifindex=((struct sockaddr_dl *)CMSG_DATA(cmsg))->sdl_index;
-                            foundRcvIf = 1;
-                        }
-                    #else
-                        if (cmsg->cmsg_type==IP_TTL) {
-                            rcv_ttl = *(int *)CMSG_DATA(cmsg);
-                        }
-                        if (cmsg->cmsg_type==IP_TOS) {
-                            rcv_tos = *(int *)CMSG_DATA(cmsg);
-                            found_rcv_tos = 1;
-                        }
-                        if (cmsg->cmsg_type==IP_PKTINFO) {
-                            rcv_ifindex=((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_ifindex;
-                            foundRcvIf = 1;
-                            rcv_inaddr=((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_addr;
-                            foundRcvIp = 1;
-                        }
-                    #endif
-                }
-            }
-    
-            if (!foundRcvIp) {
-                perror("Source IP not found on incoming packet\n");
-                continue;
-            }
-            if (!foundRcvIf) {
-                perror("Interface not found on incoming packet\n");
-                continue;
-            }
-            if (!rcv_ttl) {
-                perror("TTL not found on incoming packet\n");
-                continue;
-            }
-            if (!found_rcv_tos) {
-                if (use_ttl_id) {
-                    /*
-                     * If we're not using DSCP as the tag field then
-                     * this error doesn't matter but print the warning
-                     * anyway.
-                     */
-                    perror("Warning : ToS not found on incoming packet - continuing processing\n");
-                } else {
-                    perror("ToS not found on incoming packet\n");
+        // Find a M-SEARCH proxy port to receive replies to the multicast request
+        if (spoof_addr == inet_addr("1.1.1.3")) {
+            proxyport= port;
+            // Only allocate a proxy port if the message actually contains a M-SEARCH
+            if (!memcmp(gram+HEADER_LEN, MSEARCH_MARKER, strlen(MSEARCH_MARKER))) {
+                proxyport = find_or_create_msearch_proxy(origFromAddress, origFromPort, fromIface);
+                if (!proxyport) {
+                    DPRINT("Could not find a free M-SEARCH proxy slot\n\n");
                     continue;
                 }
             }
-    
-            struct Iface* fromIface = NULL;
-            for (int iIf = 0; iIf < maxifs; iIf++) {
-                if (ifs[iIf].ifindex == rcv_ifindex) {
-                    fromIface = &ifs[iIf];
-                }
-            }
-    
-            struct in_addr origFromAddress = rcv_addr.sin_addr;
-            u_short origFromPort = ntohs(rcv_addr.sin_port);
-            struct in_addr origToAddress = rcv_inaddr;
-            u_short origToPort = (sockidx<numproxies)?proxysocks[sockidx].localport:port;
-            u_short proxyport;
-    
-            gram[HEADER_LEN + len] = 0;
-    
-            char origFromAddressStr[255];
-            inet_ntoa2(origFromAddress, origFromAddressStr, sizeof(origFromAddressStr));
-            char origToAddressStr[255];
-            inet_ntoa2(origToAddress, origToAddressStr, sizeof(origToAddressStr));
-            DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i tos=0x%02x DSCP=%i ttl=%i)\n",
-                origFromAddressStr, origFromPort,
-                origToAddressStr, origToPort,
-                rcv_ifindex, len, rcv_tos,
-                rcv_tos >> 2, rcv_ttl
-            );
+        }
 
-            if (sockidx<numproxies) {
-                // Packet received on one of the proxy sockets. Forward directly to stored client
-                struct Iface* iface = proxysocks[sockidx].clientiface;
-				
-                struct in_addr fromAddress;
-                u_short fromPort;
+        /* Iterate through our interfaces and send packet to each one */
+        for (int iIf = 0; iIf < maxifs; iIf++) {
+            struct Iface* iface = &ifs[iIf];
+
+            /* no bounces, please */
+            if (iface == fromIface) {
+                continue;
+            }
+
+            struct in_addr fromAddress;
+            u_short fromPort;
+            if (spoof_addr == inet_addr("1.1.1.1")) {
+                fromAddress = iface->ifaddr;
+                fromPort = port;
+            } else if (spoof_addr == inet_addr("1.1.1.2")) {
+                fromAddress = iface->ifaddr;
+                fromPort = origFromPort;
+            } else if (spoof_addr == inet_addr("1.1.1.3")) {
+                fromAddress = iface->ifaddr;
+                fromPort = proxyport;
+            } else if (spoof_addr) {
+                fromAddress.s_addr = spoof_addr;
+                fromPort = origFromPort;
+            } else {
                 fromAddress = origFromAddress;
                 fromPort = origFromPort;
-
-                struct in_addr toAddress;
-                u_short toPort;
-                toAddress = proxysocks[sockidx].clienthost;
-                toPort = proxysocks[sockidx].clientport;
-				
-                char fromAddressStr[255];
-                inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
-                char toAddressStr[255];
-                inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
-                DPRINT (
-                    "-> [ %s:%d -> %s:%d (iface=%d len=%i tos=0x%02x DSCP=%i ttl=%i)] proxy [id=%u] redirect>\n\n",
-                    fromAddressStr, fromPort,
-                    toAddressStr, toPort,
-                    iface->ifindex, len, rcv_tos,
-                    rcv_tos >> 2, rcv_ttl,
-                    proxysocks[sockidx].proxyid
-                );
-
-                gram[1] = rcv_tos;
-                gram[8] = rcv_ttl;
-                memcpy(gram+12, &fromAddress.s_addr, 4);
-                memcpy(gram+16, &toAddress.s_addr, 4);
-                *(u_short*)(gram+20)=htons(fromPort);
-                *(u_short*)(gram+22)=htons(toPort);
-                #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
-                *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
-                *(u_short*)(gram+2)=HEADER_LEN + len;
-                #else
-                *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
-                *(u_short*)(gram+2)=htons(HEADER_LEN + len);
-                #endif
-                struct sockaddr_in sendAddr;
-                sendAddr.sin_family = AF_INET;
-                sendAddr.sin_port = htons(toPort);
-                sendAddr.sin_addr = toAddress;
-    
-                if (sendto(
-                    iface->raw_socket,
-                    &gram,
-                    HEADER_LEN+len,
-                    0,
-                    (struct sockaddr*)&sendAddr,
-                    sizeof(sendAddr)
-                ) < 0) {
-                    perror("sendto");
-                }
-                continue;
             }
-			
-            if (!fromIface) {
-                DPRINT("Not from managed iface\n\n");
-                continue;
+
+            struct in_addr toAddress;
+            if (rcv_inaddr.s_addr == INADDR_BROADCAST
+                || rcv_inaddr.s_addr == fromIface->dstaddr.s_addr) {
+                // Received on interface broadcast address -- rewrite to new interface broadcast addr
+                toAddress = iface->dstaddr;
+            } else {
+                // Send to whatever IP it was originally to
+                toAddress = rcv_inaddr;
             }
+            u_short toPort = origToPort;
+
+            char fromAddressStr[255];
+            inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
+            char toAddressStr[255];
+            inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
+            DPRINT (
+                "-> [ %s:%d -> %s:%d (iface=%d len=%i ",
+                fromAddressStr, fromPort,
+                toAddressStr, toPort,
+                iface->ifindex, len);
+            if (use_ttl_id) {
+                DPRINT("tos=0x%02x DSCP=%i ttl=%i)\n",
+                       rcv_tos, rcv_tos >> 2, ttl);
+            } else {
+                DPRINT("tos=0x%02x DSCP=%i ttl=%i)\n",
+                       tos + (rcv_tos & 0x03), tos >> 2, rcv_ttl);
+            }
+            /* Send the packet */
 
             if (use_ttl_id) {
-                if (rcv_ttl == ttl) {
-                    DPRINT("IP TTL (%i) matches ID (%i) + %i. Packet Ignored.\n\n",
-                           rcv_ttl, id, TTL_ID_OFFSET);
-                    continue;
-                }
+                /* Set IP TTL field */
+                /* Note. The following statement has no effect on
+                 * multicast packets, only on relayed broadcasts.
+                 * For mcast packets we have to set socket
+                 * option IP_MULTICAST_TTL to change TTL */
+                gram[8] = ttl;
             } else {
-                if ((rcv_tos & 0xfc) == tos) {
-                    DPRINT("IP DSCP (%i) matches ID. IP ToS 0x%02x. Packet Ignored.\n\n",
-                           tos >> 2, tos);
-                    continue;
+                /*
+                 * Set IP ToS byte so that DSCP = instance ID and ECN is
+                 * preserved from the original packet.
+                 */
+                gram[1] = tos + (rcv_tos & 0x03);
+                /* Set TTL to the same as the received packet */
+                gram[8] = rcv_ttl;
+                if((setsockopt(iface->raw_socket, IPPROTO_IP, IP_MULTICAST_TTL, &rcv_ttl, sizeof(rcv_ttl))) < 0) {
+                    perror("setsockopt IP_MULTICAST_TTL");
                 }
             }
+            memcpy(gram+12, &fromAddress.s_addr, 4);
+            memcpy(gram+16, &toAddress.s_addr, 4);
+            *(u_short*)(gram+20)=htons(fromPort);
+            *(u_short*)(gram+22)=htons(toPort);
+            #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
+            *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
+            *(u_short*)(gram+2)=HEADER_LEN + len;
+            #else
+            *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
+            *(u_short*)(gram+2)=htons(HEADER_LEN + len);
+            #endif
+            struct sockaddr_in sendAddr;
+            sendAddr.sin_family = AF_INET;
+            sendAddr.sin_port = htons(toPort);
+            sendAddr.sin_addr = toAddress;
 
-            // Find a proxy port to receive replies to the multicast request
-            if (spoof_addr == inet_addr("1.1.1.3")) {
-                proxyport = find_or_create_proxy(origFromAddress, origFromPort, fromIface);
-                if (!proxyport) {
-                    DPRINT("Could not find a free proxy slot\n\n");
-                    continue;
-                }
+            if (sendto(
+                iface->raw_socket,
+                &gram,
+                HEADER_LEN+len,
+                0,
+                (struct sockaddr*)&sendAddr,
+                sizeof(sendAddr)
+            ) < 0) {
+                perror("sendto");
             }
-    
-            /* Iterate through our interfaces and send packet to each one */
-            for (int iIf = 0; iIf < maxifs; iIf++) {
-                struct Iface* iface = &ifs[iIf];
-    
-                /* no bounces, please */
-                if (iface == fromIface) {
-                    continue;
-                }
-    
-                struct in_addr fromAddress;
-                u_short fromPort;
-                if (spoof_addr == inet_addr("1.1.1.1")) {
-                    fromAddress = iface->ifaddr;
-                    fromPort = port;
-                } else if (spoof_addr == inet_addr("1.1.1.2")) {
-                    fromAddress = iface->ifaddr;
-                    fromPort = origFromPort;
-                } else if (spoof_addr == inet_addr("1.1.1.3")) {
-                    fromAddress = iface->ifaddr;
-                    fromPort = proxyport;
-                    // 
-                } else if (spoof_addr) {
-                    fromAddress.s_addr = spoof_addr;
-                    fromPort = origFromPort;
-                } else {
-                    fromAddress = origFromAddress;
-                    fromPort = origFromPort;
-                }
-    
-                struct in_addr toAddress;
-                if (rcv_inaddr.s_addr == INADDR_BROADCAST
-                    || rcv_inaddr.s_addr == fromIface->dstaddr.s_addr) {
-                    // Received on interface broadcast address -- rewrite to new interface broadcast addr
-                    toAddress = iface->dstaddr;
-                } else {
-                    // Send to whatever IP it was originally to
-                    toAddress = rcv_inaddr;
-                }
-                u_short toPort = origToPort;
-    
-                char fromAddressStr[255];
-                inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
-                char toAddressStr[255];
-                inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
-                DPRINT (
-                    "-> [ %s:%d -> %s:%d (iface=%d len=%i ",
-                    fromAddressStr, fromPort,
-                    toAddressStr, toPort,
-                    iface->ifindex, len);
-                if (use_ttl_id) {
-                    DPRINT("tos=0x%02x DSCP=%i ttl=%i)\n",
-                           rcv_tos, rcv_tos >> 2, ttl);
-                } else {
-                    DPRINT("tos=0x%02x DSCP=%i ttl=%i)\n",
-                           tos + (rcv_tos & 0x03), tos >> 2, rcv_ttl);
-                }
-                /* Send the packet */
-    
-                if (use_ttl_id) {
-                    /* Set IP TTL field */
-                    /* Note. The following statement has no effect on
-                     * multicast packets, only on relayed broadcasts.
-                     * For mcast packets we have to set socket
-                     * option IP_MULTICAST_TTL to change TTL */
-                    gram[8] = ttl;
-                } else {
-                    /*
-                     * Set IP ToS byte so that DSCP = instance ID and ECN is
-                     * preserved from the original packet.
-                     */
-                    gram[1] = tos + (rcv_tos & 0x03);
-                    /* Set TTL to the same as the received packet */
-                    gram[8] = rcv_ttl;
-                    if((setsockopt(iface->raw_socket, IPPROTO_IP, IP_MULTICAST_TTL, &rcv_ttl, sizeof(rcv_ttl))) < 0) {
-                        perror("setsockopt IP_MULTICAST_TTL");
-                    }
-                }
-                memcpy(gram+12, &fromAddress.s_addr, 4);
-                memcpy(gram+16, &toAddress.s_addr, 4);
-                *(u_short*)(gram+20)=htons(fromPort);
-                *(u_short*)(gram+22)=htons(toPort);
-                #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
-                *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
-                *(u_short*)(gram+2)=HEADER_LEN + len;
-                #else
-                *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
-                *(u_short*)(gram+2)=htons(HEADER_LEN + len);
-                #endif
-                struct sockaddr_in sendAddr;
-                sendAddr.sin_family = AF_INET;
-                sendAddr.sin_port = htons(toPort);
-                sendAddr.sin_addr = toAddress;
-    
-                if (sendto(
-                    iface->raw_socket,
-                    &gram,
-                    HEADER_LEN+len,
-                    0,
-                    (struct sockaddr*)&sendAddr,
-                    sizeof(sendAddr)
-                ) < 0) {
-                    perror("sendto");
-                }
-            }
-            DPRINT ("\n");
         }
+        DPRINT ("\n");
     }
-}
+};
