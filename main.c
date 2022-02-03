@@ -19,6 +19,7 @@ GNU General Public License for more details.
 */
 
 #define MAXIFS    256
+#define MAXSUBNETS 256
 #define MAXMULTICAST 256
 #define MAX_MSEARCH_PROXY 256
 #define MAX_LOCATOR_LISTENER 256
@@ -1366,6 +1367,22 @@ void service_proxy_messages (int main_rcv_sock)
     }
 }
 
+int cidr_to_ip_and_mask(const char *cidr, uint32_t *ip, uint32_t *mask) {
+    uint8_t a, b, c, d, bits;
+    if (sscanf(cidr, "%hhu.%hhu.%hhu.%hhu/%hhu", &a, &b, &c, &d, &bits) < 5) {
+        return -1; /* didn't convert enough of CIDR */
+    }
+    if (bits > 32) {
+        return -1; /* Invalid bit count */
+    }
+    *ip = ntohl(
+        (a << 24UL) |
+        (b << 16UL) |
+        (c << 8UL) |
+        (d));
+    *mask = ntohl((0xFFFFFFFFUL << (32 - bits)) & 0xFFFFFFFFUL);
+}
+
 void sig_term_handler(int signum, siginfo_t *info, void *ptr)
 {
     unlink(g_pidfile);
@@ -1459,6 +1476,8 @@ int main(int argc,char **argv) {
     int multicastAddrsNum = 0;
     char* interfaceNames[MAXIFS];
     int interfaceNamesNum = 0;
+    char* subnets[MAXSUBNETS];
+    int subnetsNum = 0;
     in_addr_t spoof_addr = 0;
 
     /* Address broadcast packet was sent from */
@@ -1540,6 +1559,15 @@ srandom(time(NULL) & getpid());
             i++;
             interfaceNames[interfaceNamesNum] = argv[i];
             interfaceNamesNum++;
+        }
+        else if (strcmp(argv[i],"--subnet") == 0) {
+            if (subnetsNum >= MAXSUBNETS) {
+                fprintf(stderr, "More than %i subnets specified.\n", MAXSUBNETS);
+                exit(1);
+            }
+            i++;
+            subnets[subnetsNum] = argv[i];
+            subnetsNum++;
         }
         else if (strcmp(argv[i],"--pid") == 0) {
             i++;
@@ -1953,6 +1981,26 @@ srandom(time(NULL) & getpid());
         u_short origToPort = port;
         u_short proxyport;
 
+        int validSrc = 0;
+        if (subnetsNum == 0) {
+            validSrc = 1;
+        } else {
+            for (int i = 0; i < subnetsNum; i++) {
+                uint32_t ip = origFromAddress.s_addr;
+                uint32_t netip;
+                uint32_t netmask;
+
+                if (cidr_to_ip_and_mask(subnets[i], &netip, &netmask) < 0) {
+                    fprintf (stderr, "Invalid subnet: %s\n", subnets[i]);
+                    exit(1);
+                }
+
+                if ((netip & netmask) == (ip & netmask)) {
+                    validSrc = 1;
+                }
+            }
+        }
+
         gram[HEADER_LEN + len] = 0;
 
         char origFromAddressStr[255];
@@ -1982,6 +2030,11 @@ srandom(time(NULL) & getpid());
 
         if (!fromIface) {
             DPRINT("Not from managed iface\n\n");
+            continue;
+        }
+
+        if (!validSrc) {
+            DPRINT("Source IP outside subnets. Packet Ignored.\n\n");
             continue;
         }
 
