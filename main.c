@@ -1403,6 +1403,7 @@ void catch_sigterm()
 void display_usage(FILE *stream, const char *arg0) {
     fprintf(stream, "usage: %s [--id ID] [--port udp-port]\n"
             "       [--dev dev1] [--dev dev2] [--dev devX]\n"
+            "       [--subnet cidr1] [--subnet cidr2] [--subnet cidrX]\n"
             "       [-s IP] [--multicast ip1] [--multicast ipX]\n"
             "       [-t|--ttl-id] [-d] [-f]\n"
             "       [-h|--help]\n", arg0);
@@ -1434,6 +1435,9 @@ void display_help(const char *arg0) {
            "                 at least twice for two separate interfaces in\n"
            "                 order for this tool to have any effect.\n", MAXID);
     printf("Optional Parameters:\n"
+           "  --subnet cidr    Filter out packages not originating from\n"
+           "                   the specified subnet\n"
+           "                   This argument may be specified more than once.\n"
            "  -s IP    Sets the source IP of forwarded packets. If not\n"
            "           specified the original IP source address is used.\n"
            "           Special values :\n"

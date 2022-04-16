@@ -1,3 +1,13 @@
+Fork version with subnet filtering
+==========================
+This version adds a new switch (`--subnet`) for filtering packages based on originating subnet.
+
+**Example:**
+```bash
+./udpbroadcastrelay --id 1 --port 1900 --dev eth0 --dev eth1 --subnet 10.0.10.0/24 --subnet 10.0.20.0/24 --multicast 239.255.255.250
+```
+Will only relay packages originating from `10.0.10.0/24` or `10.0.20.0/24`
+
 Test version with working SSDP/UPnP DIAL proxy support
 ------------------------------------------------------
 added new -s 1.1.1.3 option to proxy SSDP/DIAL requests. This will create proxies for the UDP M-SEARCH requests and TCP Locator services and REST services connections. The smart TV will see there requests originating from its local subnet.
