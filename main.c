@@ -1395,6 +1395,7 @@ int cidr_to_ip_and_mask(const char *cidr, uint32_t *ip, uint32_t *mask) {
         (c << 8UL) |
         (d));
     *mask = ntohl((0xFFFFFFFFUL << (32 - bits)) & 0xFFFFFFFFUL);
+    return 0;
 }
 
 void sig_term_handler(int signum, siginfo_t *info, void *ptr)
@@ -1466,6 +1467,8 @@ void display_help(const char *arg0) {
            "                     source port. Replies to this local socket are\n"
            "                     are relayed back to the original sender. Used\n"
            "                     for SSDP/DIAL support, e.g. YouTube app on TV.\n"
+           "           1.1.1.4 - Same as 1.1.1.2 plus M-SEARCH proxy to GET \n"
+           "                     LOCATION message with service IP back. \n"
            "           These special values help in rare cases e.g. Chromecast\n"
            "  --multicast IP   As well as listening for broadcasts the program\n"
            "                   will listen for and relay multicast packets\n"
