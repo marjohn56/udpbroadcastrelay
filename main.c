@@ -193,6 +193,7 @@ static struct RESTSvcProxy restsvc_proxies[MAX_REST_PROXIES];
 static int num_restsvc_proxies= 0;
 static unsigned int next_restsvc_proxyid= 0;
 
+static int proxy_type= 0; // 3 if spoof ip 1.1.1.3, 4 if 1.1.1.4
 
 void inet_ntoa2(struct in_addr in, char* chr, int len) {
     char* from = inet_ntoa(in);
@@ -1190,23 +1191,26 @@ void handle_msearch_proxy_recv (int proxyidx)
     struct in_addr serverAddr;
     u_short serverPort;
 
-    if (extract_address(gram+HEADER_LEN, LOCATION_STRING_PREFIX, &addrStartPtr,
-                        &addrEndPtr, &serverAddr, &serverPort)) {
-        struct in_addr proxyAddress = iface->ifaddr;
-        u_short proxyPort = find_or_create_locsvc_listener(serverAddr, serverPort, proxyAddress);
-        if (proxyPort) {
-            char addrstr[64];
-            char proxyAddrStr[255];
-            inet_ntoa2(proxyAddress, proxyAddrStr, sizeof(proxyAddrStr));
-            snprintf(addrstr, sizeof(addrstr), "%s:%d", proxyAddrStr, proxyPort);
+    //Dont create loc svc listener in pure MSEARCH proxy mode
+    if(proxy_type == 3) {
+        if (extract_address(gram+HEADER_LEN, LOCATION_STRING_PREFIX, &addrStartPtr,
+                            &addrEndPtr, &serverAddr, &serverPort)) {
+            struct in_addr proxyAddress = iface->ifaddr;
+            u_short proxyPort = find_or_create_locsvc_listener(serverAddr, serverPort, proxyAddress);
+            if (proxyPort) {
+                char addrstr[64];
+                char proxyAddrStr[255];
+                inet_ntoa2(proxyAddress, proxyAddrStr, sizeof(proxyAddrStr));
+                snprintf(addrstr, sizeof(addrstr), "%s:%d", proxyAddrStr, proxyPort);
 
-            int lengthChange = strlen(addrstr) - (addrEndPtr-addrStartPtr);
-            if ((len+lengthChange) < (sizeof(gram)-HEADER_LEN)) {
-                memmove(addrEndPtr+lengthChange, addrEndPtr, (char*)gram + HEADER_LEN + len + 1 - addrEndPtr);
-                memcpy(addrStartPtr, addrstr, strlen(addrstr));
+                int lengthChange = strlen(addrstr) - (addrEndPtr-addrStartPtr);
+                if ((len+lengthChange) < (sizeof(gram)-HEADER_LEN)) {
+                    memmove(addrEndPtr+lengthChange, addrEndPtr, (char*)gram + HEADER_LEN + len + 1 - addrEndPtr);
+                    memcpy(addrStartPtr, addrstr, strlen(addrstr));
+                }
+            } else {
+                DPRINT("Could not find a free Locator services proxy slot - sending unmodified response\n\n");
             }
-        } else {
-            DPRINT("Could not find a free Locator services proxy slot - sending unmodified response\n\n");
         }
     }
 
@@ -1341,25 +1345,35 @@ void service_proxy_messages (int main_rcv_sock)
                         return;
 
                 case MSEARCH_SOCKET:
-                        handle_msearch_proxy_recv(proxy_array_idx[i]);
+                        if(proxy_type == 3 || proxy_type == 4) {
+                            handle_msearch_proxy_recv(proxy_array_idx[i]);
+                        }
                         break;
 
                 case LOCSVC_LISTENER:
-                        handle_loc_services_accept(proxy_array_idx[i]);
+                        if(proxy_type == 3) {
+                            handle_loc_services_accept(proxy_array_idx[i]);
+                        }
                         break;
 
                 case LOCSVC_CIENTSOCK:
                 case LOCSVC_SERVERSOCK:
-                        handle_locsvc_proxy_recv(proxy_array_idx[i], proxy_socket_type[i]);
+                        if(proxy_type == 3) {
+                            handle_locsvc_proxy_recv(proxy_array_idx[i], proxy_socket_type[i]);
+                        }
                         break;
 
                 case RESTSVC_LISTENER:
-                        handle_rest_services_accept(proxy_array_idx[i]);
+                        if(proxy_type == 3) {
+                            handle_rest_services_accept(proxy_array_idx[i]);
+                        }
                         break;
 
                 case RESTSVC_CIENTSOCK:
                 case RESTSVC_SERVERSOCK:
-                        handle_restsvc_proxy_recv(proxy_array_idx[i], proxy_socket_type[i]);
+                        if(proxy_type == 3) {
+                            handle_restsvc_proxy_recv(proxy_array_idx[i], proxy_socket_type[i]);
+                        }
                         break;
             }
         }
@@ -1480,8 +1494,6 @@ int main(int argc,char **argv) {
 #ifndef HAVE_ARC4RANDOM
 srandom(time(NULL) & getpid());
 #endif
-
-
 
     if(argc < 2) {
         display_usage(stderr, argv[0]);
@@ -1863,7 +1875,9 @@ srandom(time(NULL) & getpid());
         catch_sigterm();
 
         // Wait for message on main receive socket while servicing proxy connections
-        service_proxy_messages(rcv);
+        if(proxy_type == 3 || proxy_type == 4) {
+            service_proxy_messages(rcv);
+        }
 
         /* Receive a broadcast packet */
         int len = recvmsg(rcv,&rcv_msg,0);
@@ -1987,7 +2001,8 @@ srandom(time(NULL) & getpid());
 
         // Find a M-SEARCH proxy port to receive replies to the multicast request
         if (spoof_addr == inet_addr("1.1.1.3")) {
-            proxyport= port;
+            proxyport = port;
+            proxy_type = 3;
             // Only allocate a proxy port if the message actually contains a M-SEARCH
             if (!memcmp(gram+HEADER_LEN, MSEARCH_MARKER, strlen(MSEARCH_MARKER))) {
                 proxyport = find_or_create_msearch_proxy(origFromAddress, origFromPort, fromIface);
@@ -1996,7 +2011,18 @@ srandom(time(NULL) & getpid());
                     continue;
                 }
             }
-        }
+        } else if (spoof_addr == inet_addr("1.1.1.4")) {
+            proxyport = origFromPort;
+            proxy_type = 4;
+            // Only allocate a proxy port if the message actually contains a M-SEARCH
+            if (!memcmp(gram+HEADER_LEN, MSEARCH_MARKER, strlen(MSEARCH_MARKER))) {
+                proxyport = find_or_create_msearch_proxy(origFromAddress, origFromPort, fromIface);
+                if (!proxyport) {
+                    DPRINT("Could not find a free M-SEARCH proxy slot\n\n");
+                    continue;
+                }
+            }
+        } 
 
         /* Iterate through our interfaces and send packet to each one */
         for (int iIf = 0; iIf < maxifs; iIf++) {
@@ -2015,7 +2041,7 @@ srandom(time(NULL) & getpid());
             } else if (spoof_addr == inet_addr("1.1.1.2")) {
                 fromAddress = iface->ifaddr;
                 fromPort = origFromPort;
-            } else if (spoof_addr == inet_addr("1.1.1.3")) {
+            } else if (spoof_addr == inet_addr("1.1.1.3") || spoof_addr == inet_addr("1.1.1.4")) {
                 fromAddress = iface->ifaddr;
                 fromPort = proxyport;
             } else if (spoof_addr) {
