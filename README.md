@@ -31,6 +31,7 @@ USAGE
     --port <udp-port> \
     --dev eth0 --dev eth1
     [--dev ethx...] \
+    [--blockid id...] \
     [--multicast 224.0.0.251] \
     [-s <spoof_source_ip>]
     [-t|--ttl-id] [-d] [-f]
@@ -43,6 +44,8 @@ USAGE
 - `id` must be unique number between instances with range 1 - 63. This is
   used to set the DSCP of outgoing packets to determine if a packet is an
   echo and should be discarded.
+- `blockid` can be used to drop packets received from other instances of
+  udpbroadcastrelay using the specified ID value.
 - `udp-port` Destination udp port to listen to. Range 1 - 65535.
   Example values for common services are given below.
 - `-dev <ethx>` specifies the name of an interface to receive and

@@ -1,6 +1,6 @@
 /*
 ******************************************************************
-udbbroadcastrelay (c)2020 Martin Wasley <github.com/marjohn56> & Berto Furth <github.com/bertofurth>
+udpbroadcastrelay (c)2020 Martin Wasley <github.com/marjohn56> & Berto Furth <github.com/bertofurth>
 udp-broadcast-relay-redux
     Relays UDP broadcasts to other networks, forging
     the sender address.
@@ -20,6 +20,7 @@ GNU General Public License for more details.
 
 #define MAXIFS    256
 #define MAXMULTICAST 256
+#define MAXBLOCKIDS 256
 #define MAX_MSEARCH_PROXY 256
 #define MAX_LOCATOR_LISTENER 256
 #define MAX_LOCATOR_PROXIES 256
@@ -103,11 +104,9 @@ static u_char gram[4096+HEADER_LEN]=
 #define RESTSVC_CIENTSOCK 6
 #define RESTSVC_SERVERSOCK 7
 
-#define MSEARCH_PROXY_EXPIRY 10
-#define LOCATOR_LISTENER_EXPIRY 10
-#define LOCATOR_PROXY_EXPIRY 10
-#define REST_LISTENER_EXPIRY 10
-#define REST_PROXY_EXPIRY 10
+#define MSEARCH_PROXY_EXPIRY 86400
+#define LOCATOR_LISTENER_EXPIRY 86400
+#define REST_LISTENER_EXPIRY 86400
 
 #define BLOCK_RETRY_TIME 10
 
@@ -1441,6 +1440,9 @@ void display_help(const char *arg0) {
            "  --ttl-id|-t   Preserve DSCP and mark relayed packets by setting\n"
            "                the IP TTL header field to ID + %i. This is how the\n"
            "                original version of this tool operated by default.\n"
+           "  --blockid ID  Block traffic relayed by another udpbroadcastrelay\n"
+           "                instance with the specified ID. --blockid can be\n"
+           "                specified multiple times to block more than one ID.\n"
            "  -d       Enables debugging.\n"
            "  -f       Forces forking to background. A PID file will be created\n"
            "           at /var/run/udpbroadcastrelay_ID.pid\n"
@@ -1459,6 +1461,8 @@ int main(int argc,char **argv) {
     int multicastAddrsNum = 0;
     char* interfaceNames[MAXIFS];
     int interfaceNamesNum = 0;
+    int blockIDs[MAXBLOCKIDS];
+    int numBlockIDs = 0;
     in_addr_t spoof_addr = 0;
 
     /* Address broadcast packet was sent from */
@@ -1491,7 +1495,7 @@ srandom(time(NULL) & getpid());
     int i;
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i],"-d") == 0) {
-            DPRINT ("udpbroadcastrelay v1.1.01 built on " __DATE__ " " __TIME__ "\n");
+            DPRINT ("udpbroadcastrelay v1.1.11 built on " __DATE__ " " __TIME__ "\n");
             DPRINT ("Debugging Mode enabled\n");
             debug = 1;
         }
@@ -1526,6 +1530,15 @@ srandom(time(NULL) & getpid());
             i++;
             id = atoi(argv[i]);
             DPRINT ("ID set to %i\n", id);
+        }
+        else if (strcmp(argv[i],"--blockid") == 0) {
+            if (numBlockIDs >= MAXBLOCKIDS) {
+                fprintf(stderr, "More than maximum %i block IDs specified.\n", MAXBLOCKIDS);
+                exit(1);
+            }
+            i++;
+            blockIDs[numBlockIDs] = atoi(argv[i]);
+            numBlockIDs++;
         }
         else if (strcmp(argv[i],"--port") == 0) {
             i++;
@@ -1567,6 +1580,14 @@ srandom(time(NULL) & getpid());
         }
     }
 
+    if (numBlockIDs) {
+        DPRINT ("Blocking traffic from ID(s) %i", blockIDs[0]);
+        for (i = 1; i < numBlockIDs; i++) {
+            DPRINT (", %i", blockIDs[i]);
+        }
+        DPRINT ("\n");
+    }
+    
     if (id < 1 || id > MAXID)
     {
         fprintf (stderr,"ID argument %i not between 1 and %i\n", id, MAXID);
@@ -1976,6 +1997,18 @@ srandom(time(NULL) & getpid());
             if ((rcv_tos & 0xfc) == tos) {
                 DPRINT("IP DSCP (%i) matches ID. IP ToS 0x%02x. Packet Ignored.\n\n",
                        tos >> 2, tos);
+                continue;
+            }
+        }
+
+        if (numBlockIDs) {
+            int rxid = (use_ttl_id) ? (rcv_ttl - TTL_ID_OFFSET) : (rcv_tos >> 2);
+            for (i = 0; i < numBlockIDs; i++) {
+                if (rxid == blockIDs[i])
+                    break;
+            }
+            if (i < numBlockIDs) {
+                DPRINT ("Packet ID %i matches a blocklist ID. Packet Ignored.\n\n", rxid);
                 continue;
             }
         }
