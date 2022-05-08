@@ -78,6 +78,7 @@ static char g_pidfile[128];
 struct Iface {
     struct in_addr dstaddr;
     struct in_addr ifaddr;
+    char* ifname;
     int ifindex;
     int raw_socket;
 };
@@ -227,6 +228,17 @@ char* get_msearch_action_name (int action)
     return "<unknown>";
 }
 
+char ifname_buf[64];
+char* ifname_from_idx (int ifindex)
+{
+    for (int i=0; i<maxifs; i++)
+        if (ifs[i].ifindex == ifindex)
+            return ifs[i].ifname;
+    // shouldn't happen...
+    snprintf(ifname_buf, sizeof(ifname_buf), "Idx_%i", ifindex);
+    return ifname_buf;
+}
+
 void inet_ntoa2(struct in_addr in, char* chr, int len) {
     char* from = inet_ntoa(in);
     strncpy(chr, from, len);
@@ -360,9 +372,9 @@ int recv_with_addrinfo (int s, void *buf, size_t buflen, struct Iface **iface_ou
     char to_addrstr[255];
     inet_ntoa2(to_inaddr, to_addrstr, sizeof(to_addrstr));
     DPRINTTIME;
-    DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i)\n",
+    DPRINT("<- [ %s:%d -> %s:%d (iface=%s len=%i)\n",
         from_addrstr, from_port, to_addrstr, to_port,
-        rcv_ifindex, len
+        ifname_from_idx(rcv_ifindex), len
     );
 
     foundRcvIf = 0;
@@ -1280,8 +1292,8 @@ void handle_msearch_proxy_recv (int proxyidx)
     inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
     DPRINT2 ("   Returning M-SEARCH response via m-search proxy [id=%u]\n", msearch_proxies[proxyidx].proxyid);
     DPRINTTIME;
-    DPRINT ("-> [ %s:%d -> %s:%d (iface=%d len=%i)]\n\n", fromAddressStr, fromPort,
-            toAddressStr, toPort, iface->ifindex, len);
+    DPRINT ("-> [ %s:%d -> %s:%d (iface=%s len=%i)]\n\n", fromAddressStr, fromPort,
+            toAddressStr, toPort, ifname_from_idx(iface->ifindex), len);
 
     gram[1] = 0;    // rcv_tos
     gram[8] = 16;   // rcv_ttl;
@@ -1658,7 +1670,7 @@ srandom(time(NULL) & getpid());
         if (strcmp(argv[i],"-d") == 0) {
             debug++;
             if (debug == 1) {
-                DPRINT ("udpbroadcastrelay v1.2.00 built on " __DATE__ " " __TIME__ "\n");
+                DPRINT ("udpbroadcastrelay v1.2.10 built on " __DATE__ " " __TIME__ "\n");
                 DPRINT ("Debugging Mode enabled\n");
             }
         }
@@ -1851,6 +1863,9 @@ srandom(time(NULL) & getpid());
 
         struct ifreq basereq;
         strncpy(basereq.ifr_name,interfaceNames[i],IFNAMSIZ);
+
+        /* Save interface name for debug output */
+        iface->ifname = interfaceNames[i];
 
         /* Request index for this interface */
         {
@@ -2201,10 +2216,10 @@ srandom(time(NULL) & getpid());
         char origToAddressStr[255];
         inet_ntoa2(origToAddress, origToAddressStr, sizeof(origToAddressStr));
         DPRINTTIME;
-        DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i tos=0x%02x DSCP=%i ttl=%i)\n",
+        DPRINT("<- [ %s:%d -> %s:%d (iface=%s len=%i tos=0x%02x DSCP=%i ttl=%i)\n",
             origFromAddressStr, origFromPort,
             origToAddressStr, origToPort,
-            rcv_ifindex, len, rcv_tos,
+            ifname_from_idx(rcv_ifindex), len, rcv_tos,
             rcv_tos >> 2, rcv_ttl
         );
 
@@ -2292,10 +2307,10 @@ srandom(time(NULL) & getpid());
             inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
             DPRINTTIME;
             DPRINT (
-                "-> [ %s:%d -> %s:%d (iface=%d len=%i ",
+                "-> [ %s:%d -> %s:%d (iface=%s len=%i ",
                 fromAddressStr, fromPort,
                 toAddressStr, toPort,
-                iface->ifindex, len);
+                ifname_from_idx(iface->ifindex), len);
             if (use_ttl_id) {
                 DPRINT("tos=0x%02x DSCP=%i ttl=%i)\n",
                        rcv_tos, rcv_tos >> 2, ttl);
