@@ -21,6 +21,7 @@ GNU General Public License for more details.
 #define MAXIFS    256
 #define MAXMULTICAST 256
 #define MAXBLOCKIDS 256
+#define MAX_MSEARCH_FILTERS 64
 #define MAX_MSEARCH_PROXY 256
 #define MAX_LOCATOR_LISTENER 256
 #define MAX_LOCATOR_PROXIES 256
@@ -35,6 +36,8 @@ GNU General Public License for more details.
  */
 #define MAXID   63
 #define DPRINT  if (debug) printf
+#define DPRINT2  if (debug>=2) printf
+#define DPRINTTIME  if (debug>=2) printtime()
 #define IPHEADER_LEN 20
 #define UDPHEADER_LEN 8
 #define HEADER_LEN (IPHEADER_LEN + UDPHEADER_LEN)
@@ -104,15 +107,30 @@ static u_char gram[4096+HEADER_LEN]=
 #define RESTSVC_CIENTSOCK 6
 #define RESTSVC_SERVERSOCK 7
 
-#define MSEARCH_PROXY_EXPIRY 86400
+#define MSEARCH_PROXY_EXPIRY 60
 #define LOCATOR_LISTENER_EXPIRY 86400
 #define REST_LISTENER_EXPIRY 86400
 
 #define BLOCK_RETRY_TIME 10
 
 #define MSEARCH_MARKER "M-SEARCH * HTTP/1.1\r\n"
+#define NOTIFY_MARKER "NOTIFY * HTTP/1.1\r\n"
 #define LOCATION_STRING_PREFIX "LOCATION: http://"
 #define APPLICATION_STRING_PREFIX "Application-URL: http://"
+
+#define MSEARCH_ACTION_FORWARD 1        // Forward M-SEARCH just like other UDP packets
+#define MSEARCH_ACTION_BLOCK 2          // Drop M-SEARCH requests with this search string
+#define MSEARCH_ACTION_PROXY 3          // Proxy M-SEARCH request an response via udpbroadcastrelay without modifying packet data
+#define MSEARCH_ACTION_DIAL 10          // Full DIAL protocol processing proxy
+
+/* Define an individual M-SEARCH filter */
+struct MSEARCHFilter {
+    char* searchstring;
+    int action;
+};
+static struct MSEARCHFilter msearch_filters[MAX_MSEARCH_FILTERS];
+static int num_msearch_filters= 0;
+static int default_msearch_action= MSEARCH_ACTION_FORWARD;
 
 /* list of SSDP M-SEARCH reply listener proxies */
 struct MSEARCHProxy {
@@ -122,6 +140,7 @@ struct MSEARCHProxy {
     u_short clientport;
     struct Iface* clientiface;
     u_short localport;
+    int action;
     int sock;
 };
 static struct MSEARCHProxy msearch_proxies[MAX_MSEARCH_PROXY];
@@ -193,9 +212,41 @@ static int num_restsvc_proxies= 0;
 static unsigned int next_restsvc_proxyid= 0;
 
 
+char* get_msearch_action_name (int action)
+{
+    switch (action) {
+        case MSEARCH_ACTION_FORWARD:
+            return "FORWARD";
+        case MSEARCH_ACTION_BLOCK:
+            return "BLOCK";
+        case MSEARCH_ACTION_PROXY:
+            return "PROXY";
+        case MSEARCH_ACTION_DIAL:
+            return "DIAL";
+    }
+    return "<unknown>";
+}
+
 void inet_ntoa2(struct in_addr in, char* chr, int len) {
     char* from = inet_ntoa(in);
     strncpy(chr, from, len);
+}
+
+// Print formatted current time for log
+void printtime (void)
+{
+    struct timeval tv;
+    time_t now;
+    long millisec;
+    struct tm* tm;
+    
+    if (gettimeofday(&tv,NULL) == -1)
+        return;
+    now = tv.tv_sec;
+    tm = localtime(&now);
+    millisec = tv.tv_usec / 1000;
+    printf("%04i/%02i/%02i %02i:%02i:%02i.%03i ", tm->tm_year + 1900, tm->tm_mon + 1,
+           tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, millisec);
 }
 
 // Set socket options to receive TTL, TOS, receiving IP and interface for a socket.
@@ -308,6 +359,7 @@ int recv_with_addrinfo (int s, void *buf, size_t buflen, struct Iface **iface_ou
     inet_ntoa2(from_inaddr, from_addrstr, sizeof(from_addrstr));
     char to_addrstr[255];
     inet_ntoa2(to_inaddr, to_addrstr, sizeof(to_addrstr));
+    DPRINTTIME;
     DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i)\n",
         from_addrstr, from_port, to_addrstr, to_port,
         rcv_ifindex, len
@@ -424,7 +476,7 @@ u_short find_or_create_restsvc_listener(struct in_addr servertoaddr, u_short ser
         if (restsvc_listeners[i].expirytime < now) {
             inet_ntoa2(restsvc_listeners[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
             inet_ntoa2(restsvc_listeners[i].localaddr, localaddrStr, sizeof(localaddrStr));
-            DPRINT("   _Expire REST_Svc listener [id=%u] for proxy to %s:%d on local address %s:%d. %d proxies left\n",
+            DPRINT2("   _Expire REST_Svc listener [id=%u] for proxy to %s:%d on local address %s:%d. %d proxies left\n",
                    restsvc_listeners[i].listenerid,
                    serveraddrStr, restsvc_listeners[i].serverport,
                    localaddrStr, restsvc_listeners[i].localport,
@@ -593,7 +645,7 @@ void handle_rest_services_accept (int listerneridx)
         if (restsvc_proxies[i].clientsock < 0) {
             inet_ntoa2(restsvc_proxies[i].clientaddr, clientaddrStr, sizeof(clientaddrStr));
             inet_ntoa2(restsvc_proxies[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
-            DPRINT("   _Scavange REST_Svc proxy [id=%u] for client %s:%d to server %s:%d. %d proxies left\n",
+            DPRINT2("   _Scavange REST_Svc proxy [id=%u] for client %s:%d to server %s:%d. %d proxies left\n",
                    restsvc_proxies[i].proxyid,
                    clientaddrStr, restsvc_proxies[i].clientport,
                    serveraddrStr, restsvc_proxies[i].serverport,
@@ -676,13 +728,14 @@ void handle_restsvc_proxy_recv (int proxyidx, int socktype)
 
     inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
     inet_ntoa2(tolocaladdr, localaddrStr, sizeof(localaddrStr));
+    DPRINTTIME;
     DPRINT("<- TCP [ %s:%d -> %s:%d (len=%i)] to REST_Svc proxy [id=%u]\n",
         fromaddrStr, fromport, localaddrStr, tolocalport,
         numread, restsvc_proxies[proxyidx].proxyid
     );
 
     if (numread<=0) {
-        DPRINT((numread==0)?
+        DPRINT2((numread==0)?
                "   %s connection gracefully closed. Shutting down REST_Svc proxy [id=%u].\n":
                "   Error reading %s socket. Shutting down REST_Svc proxy [id=%u].\n\n",
                socktype==RESTSVC_CIENTSOCK?"Client":"Server", restsvc_proxies[proxyidx].proxyid
@@ -733,6 +786,7 @@ void handle_restsvc_proxy_recv (int proxyidx, int socktype)
     inet_ntoa2(fromlocaladdr, localaddrStr, sizeof(localaddrStr));
     inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
     inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
+    DPRINTTIME;
     DPRINT("-> TCP [ %s:%d -> %s:%d (len=%i)] for %s %s:%d via REST_Svc proxy [id=%u]\n\n",
         localaddrStr, fromlocalport, toaddrStr, toport, numwritten,
         socktype==RESTSVC_CIENTSOCK?"client":"server",
@@ -752,7 +806,7 @@ u_short find_or_create_locsvc_listener(struct in_addr servertoaddr, u_short serv
         if (locatorsvc_listeners[i].expirytime < now) {
             inet_ntoa2(locatorsvc_listeners[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
             inet_ntoa2(locatorsvc_listeners[i].localaddr, localaddrStr, sizeof(localaddrStr));
-            DPRINT("   _Expire LocatorSvc listener [id=%u] for proxy to %s:%d on local address %s:%d. %d proxies left\n",
+            DPRINT2("   _Expire LocatorSvc listener [id=%u] for proxy to %s:%d on local address %s:%d. %d proxies left\n",
                    locatorsvc_listeners[i].listenerid,
                    serveraddrStr, locatorsvc_listeners[i].serverport,
                    localaddrStr, locatorsvc_listeners[i].localport,
@@ -921,7 +975,7 @@ void handle_loc_services_accept (int listerneridx)
         if (locatorsvc_proxies[i].clientsock < 0) {
             inet_ntoa2(locatorsvc_proxies[i].clientaddr, clientaddrStr, sizeof(clientaddrStr));
             inet_ntoa2(locatorsvc_proxies[i].serveraddr, serveraddrStr, sizeof(serveraddrStr));
-            DPRINT("   _Scavange LocatorSvc proxy [id=%u] for client %s:%d to server %s:%d. %d proxies left\n",
+            DPRINT2("   _Scavange LocatorSvc proxy [id=%u] for client %s:%d to server %s:%d. %d proxies left\n",
                    locatorsvc_proxies[i].proxyid,
                    clientaddrStr, locatorsvc_proxies[i].clientport,
                    serveraddrStr, locatorsvc_proxies[i].serverport,
@@ -1004,13 +1058,14 @@ void handle_locsvc_proxy_recv (int proxyidx, int socktype)
 
     inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
     inet_ntoa2(tolocaladdr, localaddrStr, sizeof(localaddrStr));
+    DPRINTTIME;
     DPRINT("<- TCP [ %s:%d -> %s:%d (len=%i)] to LocatorSvc proxy [id=%u]\n",
         fromaddrStr, fromport, localaddrStr, tolocalport,
         numread, locatorsvc_proxies[proxyidx].proxyid
     );
 
     if (numread<=0) {
-        DPRINT((numread==0)?
+        DPRINT2((numread==0)?
                "   %s connection gracefully closed. Shutting down LocatorSvc proxy [id=%u].\n":
                "   Error reading %s socket. Shutting down LocatorSvc proxy [id=%u].\n\n",
                socktype==LOCSVC_CIENTSOCK?"Client":"Server", locatorsvc_proxies[proxyidx].proxyid
@@ -1091,6 +1146,7 @@ void handle_locsvc_proxy_recv (int proxyidx, int socktype)
     inet_ntoa2(fromlocaladdr, localaddrStr, sizeof(localaddrStr));
     inet_ntoa2(toaddr, toaddrStr, sizeof(toaddrStr));
     inet_ntoa2(fromaddr, fromaddrStr, sizeof(fromaddrStr));
+    DPRINTTIME;
     DPRINT("-> TCP [ %s:%d -> %s:%d (len=%i)] for %s %s:%d via LocatorSvc proxy [id=%u]\n\n",
         localaddrStr, fromlocalport, toaddrStr, toport, numwritten,
         socktype==LOCSVC_CIENTSOCK?"client":"server",
@@ -1099,9 +1155,9 @@ void handle_locsvc_proxy_recv (int proxyidx, int socktype)
 }
 
 // Find the M-SEARCH request proxy for a given client and return the UDP port
-// number on which the proxy listens. Return 0 if no proxy was found an a new
+// number on which the proxy listens. Return 0 if no proxy was found and a new
 // one could not be created. Also expire old proxies that have not been used.
-u_short find_or_create_msearch_proxy(struct in_addr clientfromaddr, u_short clientfromport, struct Iface* iface) {
+u_short find_or_create_msearch_proxy(struct in_addr clientfromaddr, u_short clientfromport, struct Iface* iface, int action) {
     time_t now = time(NULL);
     int i= 0;
     // Look for an existing proxy for this source host ip:port
@@ -1109,7 +1165,7 @@ u_short find_or_create_msearch_proxy(struct in_addr clientfromaddr, u_short clie
         if (msearch_proxies[i].expirytime < now) {
             char clienthostStr[255];
             inet_ntoa2(msearch_proxies[i].clienthost, clienthostStr, sizeof(clienthostStr));
-            DPRINT("   _Expire M-SEARCH proxy [id=%u] for %s:%d on local port %d. %d proxies left\n",
+            DPRINT2("   _Expire M-SEARCH proxy [id=%u] for %s:%d on local port %d. %d proxies left\n",
                    msearch_proxies[i].proxyid, clienthostStr,
                    msearch_proxies[i].clientport, msearch_proxies[i].localport,
                    num_msearch_proxies-1
@@ -1126,7 +1182,7 @@ u_short find_or_create_msearch_proxy(struct in_addr clientfromaddr, u_short clie
                    msearch_proxies[i].proxyid, clienthostStr,
                    msearch_proxies[i].clientport, msearch_proxies[i].localport
             );
-            msearch_proxies[i].expirytime = now+10;    //  Update expiry time
+            msearch_proxies[i].expirytime = now+MSEARCH_PROXY_EXPIRY;    //  Update expiry time
             return msearch_proxies[i].localport;
         }
         i++;
@@ -1157,13 +1213,14 @@ u_short find_or_create_msearch_proxy(struct in_addr clientfromaddr, u_short clie
         return 0;
     }
 
-    msearch_proxies[num_msearch_proxies].expirytime = now+10;    //  Expire in 10 seconds
+    msearch_proxies[num_msearch_proxies].expirytime = now+MSEARCH_PROXY_EXPIRY;
     msearch_proxies[num_msearch_proxies].proxyid = next_msearch_proxyid++;
     msearch_proxies[num_msearch_proxies].clienthost = clientfromaddr;
     msearch_proxies[num_msearch_proxies].clientport = clientfromport;
     msearch_proxies[num_msearch_proxies].sock = newsock;
     msearch_proxies[num_msearch_proxies].clientiface= iface;
     msearch_proxies[num_msearch_proxies].localport = localport;
+    msearch_proxies[num_msearch_proxies].action = action;
     num_msearch_proxies++;
 
     char clientfromaddrStr[255];
@@ -1189,8 +1246,9 @@ void handle_msearch_proxy_recv (int proxyidx)
     struct in_addr serverAddr;
     u_short serverPort;
 
-    if (extract_address(gram+HEADER_LEN, LOCATION_STRING_PREFIX, &addrStartPtr,
-                        &addrEndPtr, &serverAddr, &serverPort)) {
+    if ( (msearch_proxies[proxyidx].action == MSEARCH_ACTION_DIAL) &&
+         (extract_address(gram+HEADER_LEN, LOCATION_STRING_PREFIX, &addrStartPtr,
+                          &addrEndPtr, &serverAddr, &serverPort)) ) {
         struct in_addr proxyAddress = iface->ifaddr;
         u_short proxyPort = find_or_create_locsvc_listener(serverAddr, serverPort, proxyAddress);
         if (proxyPort) {
@@ -1198,6 +1256,8 @@ void handle_msearch_proxy_recv (int proxyidx)
             char proxyAddrStr[255];
             inet_ntoa2(proxyAddress, proxyAddrStr, sizeof(proxyAddrStr));
             snprintf(addrstr, sizeof(addrstr), "%s:%d", proxyAddrStr, proxyPort);
+            DPRINT("   Updating M-SEARCH Locator address from %.*s to %s\n",
+                   (addrEndPtr-addrStartPtr), addrStartPtr, addrstr);
 
             int lengthChange = strlen(addrstr) - (addrEndPtr-addrStartPtr);
             if ((len+lengthChange) < (sizeof(gram)-HEADER_LEN)) {
@@ -1218,11 +1278,10 @@ void handle_msearch_proxy_recv (int proxyidx)
     inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
     char toAddressStr[255];
     inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
-    DPRINT (
-        "-> [ %s:%d -> %s:%d (iface=%d len=%i)] m-search proxy [id=%u] reply\n\n",
-        fromAddressStr, fromPort, toAddressStr, toPort,
-        iface->ifindex, len, msearch_proxies[proxyidx].proxyid
-    );
+    DPRINT2 ("   Returning M-SEARCH response via m-search proxy [id=%u]\n", msearch_proxies[proxyidx].proxyid);
+    DPRINTTIME;
+    DPRINT ("-> [ %s:%d -> %s:%d (iface=%d len=%i)]\n\n", fromAddressStr, fromPort,
+            toAddressStr, toPort, iface->ifindex, len);
 
     gram[1] = 0;    // rcv_tos
     gram[8] = 16;   // rcv_ttl;
@@ -1252,6 +1311,96 @@ void handle_msearch_proxy_recv (int proxyidx)
     ) < 0) {
         perror("sendto");
     }
+}
+
+// Look at list of M-SEARCH filters to determine how to handle a particular packet. A return value of 0 means
+// the packet should be dropped. if non-zero, proxyPort will either be 0 (forward packet as normal) or contain
+// the UDP port number of a proxy instance.
+int check_msearch_filters (struct in_addr clientfromaddr, u_short clientfromport, struct Iface* iface, u_short* proxyPort)
+{
+    char* CRLF;
+    char* ST;
+    int STlen;
+    int action = -1;
+    
+    // Check that we have a M-SEARCH request header
+    if (memcmp(gram + HEADER_LEN, MSEARCH_MARKER, strlen(MSEARCH_MARKER))) {
+        // M-SEARCH header not found. Also check NOTIFY header for debugging purposes
+        if (!memcmp(gram + HEADER_LEN, NOTIFY_MARKER, strlen(NOTIFY_MARKER))) {
+            ST = gram + HEADER_LEN + strlen(NOTIFY_MARKER);
+            CRLF = strstr(ST, "\r\n");
+            while (CRLF) {
+                // Look for "NT:" header (case insensitive)
+                if ( ((ST[0]|0x20) == 'n') && ((ST[1]|0x20) == 't') && (ST[2] == ':') ) {
+                    // Skip past any possible white-space
+                    ST += 3;
+                    while ((*ST == ' ') || (*ST == '\t')) {
+                        ST++;
+                    }
+                    STlen = CRLF - ST;
+                    DPRINT2("   Found NOTIFY search term %.*s\n", STlen, ST);
+                    break;
+                }
+                ST = CRLF + 2;
+                CRLF = strstr(ST, "\r\n");
+            }
+        }
+        // Indicate packet should be forwarded as normal
+        *proxyPort = 0;
+        return 1;
+    }
+
+    ST = gram + HEADER_LEN + strlen(MSEARCH_MARKER);
+    CRLF = strstr(ST, "\r\n");
+    while (CRLF) {
+        // Look for "ST:" header (case insensitive)
+        if ( ((ST[0]|0x20) == 's') && ((ST[1]|0x20) == 't') && (ST[2] == ':') ) {
+            // Skip past any possible white-space
+            ST += 3;
+            while ((*ST == ' ') || (*ST == '\t')) {
+                ST++;
+            }
+            STlen = CRLF - ST;
+            DPRINT2("   Found M-SEARCH search term %.*s\n", STlen, ST);
+
+            // Compare ST search term with saved search filters
+            for (int i=0; i < num_msearch_filters; i++) {
+                if ( strncmp(msearch_filters[i].searchstring, ST, STlen) ||
+                     msearch_filters[i].searchstring[STlen] )
+                    continue;
+                action = msearch_filters[i].action;
+                DPRINT2("   Matched ST filter and found action %s\n", get_msearch_action_name(action));
+                break;
+            }
+            break;
+        }
+        ST = CRLF + 2;
+        CRLF = strstr(ST, "\r\n");
+    }
+    // Apply default msearch action
+    if (action < 0) {
+        action = default_msearch_action;
+        DPRINT2("   Applying default action %s\n", get_msearch_action_name(action));
+    }
+
+    if (action == MSEARCH_ACTION_FORWARD) {
+        *proxyPort = 0;
+        return 1;
+    }
+    else if ( (action == MSEARCH_ACTION_PROXY) || (action == MSEARCH_ACTION_DIAL) ) {
+        *proxyPort = find_or_create_msearch_proxy(clientfromaddr, clientfromport, iface, action);
+        if (!*proxyPort) {
+            DPRINT("Could not find a free M-SEARCH proxy slot, dropping packet\n\n");
+            return 0;
+        }
+        return 1;
+    }
+    else if (action == MSEARCH_ACTION_BLOCK) {
+        DPRINT("\n");
+        return 0;
+    }
+    DPRINT("   Unknown action %i, dropping packet\n\n", action);
+    return 0;   // Treat unknown action as BLOCK
 }
 
 void service_proxy_messages (int main_rcv_sock)
@@ -1425,12 +1574,24 @@ void display_help(const char *arg0) {
            "                     UDP port.\n"
            "           1.1.1.2 - Use the outgoing interface ip address as \n"
            "                     source IP. Does not modify UDP ports.\n"
-           "           1.1.1.3 - Use the outgoing interface ip address as \n"
-           "                     source IP and port number of local UDP socket\n"
-           "                     source port. Replies to this local socket are\n"
-           "                     are relayed back to the original sender. Used\n"
-           "                     for SSDP/DIAL support, e.g. YouTube app on TV.\n"
            "           These special values help in rare cases e.g. Chromecast\n"
+           "  --msearch action[,search-term]\n"
+           "           Enable special handling of SSDP M-SEARCH requests. The\n"
+           "           action parameter can be one of the following values:\n"
+           "               block     Block M-SEARCH requests\n"
+           "               fwd       Forward M-SEARCH requests like normal packets\n"
+           "               proxy     Relay M-SEARCH requests via a local proxy\n"
+           "                         socket. Replies to this local socket are\n"
+           "                         forwarded to the original sender unmodified.\n"
+           "               dial      Full SSDP/DIAL protocol proxy. Relay M-SEARCH\n"
+           "                         requests via a local proxy socket. Replies\n"
+           "                         are modified with the local address of\n"
+           "                         Location Services and REST proxies.\n"
+           "                         Used to support e.g. YouTube app on smart TV.\n"
+           "           The search-term parameter can specify a M-SEARCH ST: header\n"
+           "           value in which case the --msearch action will only apply to\n"
+           "           that search-term. If no search-term is given this action\n"
+           "           becomes the new default for packets with no matching ST.\n"
            "  --multicast IP   As well as listening for broadcasts the program\n"
            "                   will listen for and relay multicast packets\n"
            "                   using the specified multicast IP address(es).\n"
@@ -1443,7 +1604,7 @@ void display_help(const char *arg0) {
            "  --blockid ID  Block traffic relayed by another udpbroadcastrelay\n"
            "                instance with the specified ID. --blockid can be\n"
            "                specified multiple times to block more than one ID.\n"
-           "  -d       Enables debugging.\n"
+           "  -d       Enables debugging. Specify twice for extra debug info.\n"
            "  -f       Forces forking to background. A PID file will be created\n"
            "           at /var/run/udpbroadcastrelay_ID.pid\n"
            "  --help|-h   Display this detailed help dialog.\n", TTL_ID_OFFSET);
@@ -1495,9 +1656,11 @@ srandom(time(NULL) & getpid());
     int i;
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i],"-d") == 0) {
-            DPRINT ("udpbroadcastrelay v1.1.11 built on " __DATE__ " " __TIME__ "\n");
-            DPRINT ("Debugging Mode enabled\n");
-            debug = 1;
+            debug++;
+            if (debug == 1) {
+                DPRINT ("udpbroadcastrelay v1.2.00 built on " __DATE__ " " __TIME__ "\n");
+                DPRINT ("Debugging Mode enabled\n");
+            }
         }
         if ((strcmp(argv[i], "--help") == 0) ||
             (strcmp(argv[i], "-h") == 0)) {
@@ -1566,6 +1729,61 @@ srandom(time(NULL) & getpid());
             i++;
             multicastAddrs[multicastAddrsNum] = argv[i];
             multicastAddrsNum++;
+        }
+        else if (strcmp(argv[i],"--msearch") == 0) {
+            char* s;
+            int action;
+            int len;
+
+            i++;
+            len = strlen(argv[i]);
+            s = strchr(argv[i],',');
+            /* Check if an optional search string was specified for the msearch option */
+            if (s) {
+                len = s - argv[i];
+                s++;
+            }
+            if (!strncmp("fwd",argv[i],len)) {
+                action = MSEARCH_ACTION_FORWARD;
+            }
+            else if (!strncmp("block",argv[i],len)) {
+                action = MSEARCH_ACTION_BLOCK;
+            }
+            else if (!strncmp("proxy",argv[i],len)) {
+                action = MSEARCH_ACTION_PROXY;
+            }
+            else if (!strncmp("dial",argv[i],len)) {
+                action = MSEARCH_ACTION_DIAL;
+            }
+            else {
+                fprintf(stderr, "Unknown --msearch action %.*s specified\n", len, argv[i]);
+                exit(1);
+            }
+
+            /* Default to DIAL protocol search term if dial action was specified with no search term */
+            if ((action == MSEARCH_ACTION_DIAL) && (!s)) {
+                s = "urn:dial-multiscreen-org:service:dial:1";
+                DPRINT ("Set default M-SEARCH search term %s for the DIAL protocol\n", s);
+            }
+            /* Update search term filter list if a specific search term was specified */
+            if (s) {
+                if (num_msearch_filters >= MAX_MSEARCH_FILTERS) {
+                    fprintf(stderr, "More than maximum of %i M-SEARCH filter terms specified\n", MAX_MSEARCH_FILTERS);
+                    exit(1);
+                }
+                if (!*s) {
+                    fprintf(stderr, "M-SEARCH search string filter can't be empty\n");
+                    exit(1);
+                }
+                msearch_filters[num_msearch_filters].searchstring = s;
+                msearch_filters[num_msearch_filters].action = action;
+                num_msearch_filters++;
+                DPRINT ("Added M-SEARCH filter %i: search term '%s' action %s\n", num_msearch_filters, s, get_msearch_action_name(action));
+            }
+            else {
+                default_msearch_action= action;
+                DPRINT ("Set default M-SEARCH action to %s\n", get_msearch_action_name(action));
+            }
         }
         else if ((strcmp(argv[i], "--ttl-id") == 0) ||
                  (strcmp(argv[i], "-t") == 0)) {
@@ -1972,14 +2190,17 @@ srandom(time(NULL) & getpid());
         u_short origFromPort = ntohs(rcv_addr.sin_port);
         struct in_addr origToAddress = rcv_inaddr;
         u_short origToPort = port;
-        u_short proxyport;
+        u_short proxyPort;
 
+        // Ensure received datagram is always NULL terminated, makes it
+        // easier to use string functions on the datagram.
         gram[HEADER_LEN + len] = 0;
 
         char origFromAddressStr[255];
         inet_ntoa2(origFromAddress, origFromAddressStr, sizeof(origFromAddressStr));
         char origToAddressStr[255];
         inet_ntoa2(origToAddress, origToAddressStr, sizeof(origToAddressStr));
+        DPRINTTIME;
         DPRINT("<- [ %s:%d -> %s:%d (iface=%d len=%i tos=0x%02x DSCP=%i ttl=%i)\n",
             origFromAddressStr, origFromPort,
             origToAddressStr, origToPort,
@@ -2018,17 +2239,11 @@ srandom(time(NULL) & getpid());
             continue;
         }
 
-        // Find a M-SEARCH proxy port to receive replies to the multicast request
-        if (spoof_addr == inet_addr("1.1.1.3")) {
-            proxyport= port;
-            // Only allocate a proxy port if the message actually contains a M-SEARCH
-            if (!memcmp(gram+HEADER_LEN, MSEARCH_MARKER, strlen(MSEARCH_MARKER))) {
-                proxyport = find_or_create_msearch_proxy(origFromAddress, origFromPort, fromIface);
-                if (!proxyport) {
-                    DPRINT("Could not find a free M-SEARCH proxy slot\n\n");
-                    continue;
-                }
-            }
+        // Check if we need to perform special M-SEARCH request handling
+        proxyPort = 0;
+        if ((default_msearch_action != MSEARCH_ACTION_FORWARD) || num_msearch_filters) {
+            if (!check_msearch_filters(origFromAddress, origFromPort, fromIface, &proxyPort))
+                continue;
         }
 
         /* Iterate through our interfaces and send packet to each one */
@@ -2048,15 +2263,16 @@ srandom(time(NULL) & getpid());
             } else if (spoof_addr == inet_addr("1.1.1.2")) {
                 fromAddress = iface->ifaddr;
                 fromPort = origFromPort;
-            } else if (spoof_addr == inet_addr("1.1.1.3")) {
-                fromAddress = iface->ifaddr;
-                fromPort = proxyport;
             } else if (spoof_addr) {
                 fromAddress.s_addr = spoof_addr;
                 fromPort = origFromPort;
             } else {
                 fromAddress = origFromAddress;
                 fromPort = origFromPort;
+            }
+            if (proxyPort) {
+                fromAddress = iface->ifaddr;
+                fromPort = proxyPort;
             }
 
             struct in_addr toAddress;
@@ -2074,6 +2290,7 @@ srandom(time(NULL) & getpid());
             inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
             char toAddressStr[255];
             inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
+            DPRINTTIME;
             DPRINT (
                 "-> [ %s:%d -> %s:%d (iface=%d len=%i ",
                 fromAddressStr, fromPort,

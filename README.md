@@ -1,11 +1,16 @@
-Test version with working SSDP/UPnP DIAL proxy support
-------------------------------------------------------
-added new -s 1.1.1.3 option to proxy SSDP/DIAL requests. This will create proxies for the UDP M-SEARCH requests and TCP Locator services and REST services connections. The smart TV will see there requests originating from its local subnet.
+Test version with improved general SSD support and small fixes
+--------------------------------------------------------------
+
+- Removed the `-s 1.1.1.3` option and replaced it with a more general `--msearch`
+  option, which allows finer control (see USAGE section)
+- Updated the expiry time for M-SEARCH, Locator and REST proxies.
+- Fixed build information not being printed when `-d` is specififed
+- Introduced a second level of debug info, activated by specifying `-d` twice
 
 
 UDP Broadcast Relay for Linux / FreeBSD / pfSense / OPNsense
+============================================================
 ( For Opensense a plugin is already available )
-==========================
 
 This program listens for packets on a specified UDP broadcast port. When
 a packet is received, it sends that packet to all specified interfaces
@@ -32,6 +37,7 @@ USAGE
     --dev eth0 --dev eth1
     [--dev ethx...] \
     [--blockid id...] \
+    [--msearch action[,search-term]] \   
     [--multicast 224.0.0.251] \
     [-s <spoof_source_ip>]
     [-t|--ttl-id] [-d] [-f]
@@ -59,13 +65,33 @@ USAGE
   is unusual.
 - A special source ip of `-s 1.1.1.1` can be used to set the source ip
   to the address of the outgoing interface and the source UDP port to the
-  same as the destination port. '-s 1.1.1.2' does the same but leaves
+  same as the destination port. `-s 1.1.1.2` does the same but leaves
   the UDP ports unchanged. These values are notably required to cater
   for the Chromecast system.
+- Special SSDP processing can be turned on using the `--msearch` option.
+  By default SSDP M-SEARCH packets are treated the same as any other
+  packet. The `action` parameter changes this default:
+  - `block`:  drop the M-SEARCH packet.
+  - `fwd`:    forward the M-SEARCH packet like a regular packet (and the
+  `-s` into account).
+  - `proxy`:  create a local proxy for the M-SEARCH request, send request
+  out with subnet local address and proxy port. Received responses are
+  sent back to original requester with no processing.
+  - `dial`:   perform full DIAL protocol processing on M-SEARCH request.
+  Create proxies for M-SEARCH, Locator and REST services. Use this for
+  Youtube app on Smart TVs
+  
+  When a `search-term` is also specified the given action will only apply
+  to M-SEARCH packets containing this specific search term. `--msearch`
+  can be specified multiple times to add more search terms. The value of `-s`
+  affects normal and M-SEARCH packets with the forward action.
+  
+  The old `-s 1.1.1.3` option should be replaced with `--msearch dial`.
+  
 - The original version of this tool marked the TTL of outgoing relayed
   packets to detect echos and preserved DSCP. This original behavior can
   be restored by setting the [-t|--ttl-id] parameter.
-- `-d` will enable debugging output.
+- `-d` will enable debugging output. Specify `-d` twice for extra debugging info
 - `-f` will fork the application to the background and create a pid file
   at /var/run/udpbroadcastrelay_ID.pid
 - `-h|--help` Display a detailed help dialog.
@@ -108,6 +134,11 @@ EXAMPLE
 #### Raknet Discovery (Minecraft)
 `./udpbroadcastrelay --id 1 --port 19132 --dev eth0 --dev eth1`
 
+#### Youtube Application on Smart TV
+`./udpbroadcastrelay --id 1 --dev eth0 --dev eth1 --port 1900 --multicast 239.255.255.250 -s 1.1.1.2 --msearch dial`
+
+#### Youtube Application on Smart TV along with DLNA media playback
+`./udpbroadcastrelay --id 1 --dev eth0 --dev eth1 --port 1900 --multicast 239.255.255.250 -s 1.1.1.2 --msearch proxy,urn:schemas-upnp-org:device:MediaServer:1 --msearch dial`
 
 Note about firewall rules
 ---
