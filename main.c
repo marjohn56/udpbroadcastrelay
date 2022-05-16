@@ -97,6 +97,7 @@ static u_char gram[4096+HEADER_LEN]=
     0x00,    0x12,    0x00,    0x00,
     '1','2','3','4','5','6','7','8','9','0'
 };
+static u_short fragmentID = 0;
 
 /* types of sockets we receive data on */
 #define MAIN_SOCKET 0
@@ -1299,6 +1300,7 @@ void handle_msearch_proxy_recv (int proxyidx)
     gram[8] = 16;   // rcv_ttl;
     memcpy(gram+12, &fromAddress.s_addr, 4);
     memcpy(gram+16, &toAddress.s_addr, 4);
+    *(u_short*)(gram+4)=htons(fragmentID++);
     *(u_short*)(gram+20)=htons(fromPort);
     *(u_short*)(gram+22)=htons(toPort);
     #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
@@ -2341,6 +2343,7 @@ srandom(time(NULL) & getpid());
             }
             memcpy(gram+12, &fromAddress.s_addr, 4);
             memcpy(gram+16, &toAddress.s_addr, 4);
+            *(u_short*)(gram+4)=htons(fragmentID++);
             *(u_short*)(gram+20)=htons(fromPort);
             *(u_short*)(gram+22)=htons(toPort);
             #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
