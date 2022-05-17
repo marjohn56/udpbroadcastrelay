@@ -44,6 +44,8 @@ GNU General Public License for more details.
 #define TTL_ID_OFFSET 64
 #define SIGF_TERM 0x1
 
+#include <time.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in_systm.h>
@@ -70,8 +72,6 @@ GNU General Public License for more details.
 #include <fcntl.h>
 
 static int debug = 0;
-static int exit_ok = 0;
-static sig_atomic_t sig_flags = 0;
 static char g_pidfile[128];
 
 /* list of addresses and interface numbers on local machine */
@@ -259,7 +259,7 @@ void printtime (void)
     tm = localtime(&now);
     millisec = tv.tv_usec / 1000;
     printf("%04i/%02i/%02i %02i:%02i:%02i.%03i ", tm->tm_year + 1900, tm->tm_mon + 1,
-           tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, millisec);
+           tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, (int) millisec);
 }
 
 // Set socket options to receive TTL, TOS, receiving IP and interface for a socket.
@@ -1105,7 +1105,7 @@ void handle_locsvc_proxy_recv (int proxyidx, int socktype)
             u_short proxyPort = find_or_create_restsvc_listener(serverAddr, serverPort, proxyAddress);
             if (proxyPort) {
                 char addrstr[64];
-                char proxyAddrStr[255];
+                char proxyAddrStr[56];
                 inet_ntoa2(proxyAddress, proxyAddrStr, sizeof(proxyAddrStr));
                 snprintf(addrstr, sizeof(addrstr), "%s:%d", proxyAddrStr, proxyPort);
 
@@ -1260,17 +1260,17 @@ void handle_msearch_proxy_recv (int proxyidx)
     u_short serverPort;
 
     if ( (msearch_proxies[proxyidx].action == MSEARCH_ACTION_DIAL) &&
-         (extract_address(gram+HEADER_LEN, LOCATION_STRING_PREFIX, &addrStartPtr,
+         (extract_address((char*)gram + HEADER_LEN, LOCATION_STRING_PREFIX, &addrStartPtr,
                           &addrEndPtr, &serverAddr, &serverPort)) ) {
         struct in_addr proxyAddress = iface->ifaddr;
         u_short proxyPort = find_or_create_locsvc_listener(serverAddr, serverPort, proxyAddress);
         if (proxyPort) {
             char addrstr[64];
-            char proxyAddrStr[255];
+            char proxyAddrStr[56];
             inet_ntoa2(proxyAddress, proxyAddrStr, sizeof(proxyAddrStr));
             snprintf(addrstr, sizeof(addrstr), "%s:%d", proxyAddrStr, proxyPort);
             DPRINT("   Updating M-SEARCH Locator address from %.*s to %s\n",
-                   (addrEndPtr-addrStartPtr), addrStartPtr, addrstr);
+                   (int)(addrEndPtr-addrStartPtr), addrStartPtr, addrstr);
 
             int lengthChange = strlen(addrstr) - (addrEndPtr-addrStartPtr);
             if ((len+lengthChange) < (sizeof(gram)-HEADER_LEN)) {
@@ -1341,7 +1341,7 @@ int check_msearch_filters (struct in_addr clientfromaddr, u_short clientfromport
     if (memcmp(gram + HEADER_LEN, MSEARCH_MARKER, strlen(MSEARCH_MARKER))) {
         // M-SEARCH header not found. Also check NOTIFY header for debugging purposes
         if (!memcmp(gram + HEADER_LEN, NOTIFY_MARKER, strlen(NOTIFY_MARKER))) {
-            ST = gram + HEADER_LEN + strlen(NOTIFY_MARKER);
+            ST = (char*)gram + HEADER_LEN + strlen(NOTIFY_MARKER);
             CRLF = strstr(ST, "\r\n");
             while (CRLF) {
                 // Look for "NT:" header (case insensitive)
@@ -1364,7 +1364,7 @@ int check_msearch_filters (struct in_addr clientfromaddr, u_short clientfromport
         return 1;
     }
 
-    ST = gram + HEADER_LEN + strlen(MSEARCH_MARKER);
+    ST = (char*)gram + HEADER_LEN + strlen(MSEARCH_MARKER);
     CRLF = strstr(ST, "\r\n");
     while (CRLF) {
         // Look for "ST:" header (case insensitive)
@@ -1627,11 +1627,10 @@ void display_help(const char *arg0) {
 int main(int argc,char **argv) {
     /* Debugging, forking, other settings */
     FILE *pidfp;
-    int forking = 0, pid;
+    int forking = 0;
     int use_ttl_id = 0;
     u_int16_t port = 0;
     u_char id = 0;
-    char *usr_pid = 0;
     char* multicastAddrs[MAXMULTICAST];
     int multicastAddrsNum = 0;
     char* interfaceNames[MAXIFS];
@@ -1657,7 +1656,7 @@ int main(int argc,char **argv) {
 
     int child_pid;
 #ifndef HAVE_ARC4RANDOM
-srandom(time(NULL) & getpid());
+srandom(time(NULL) ^ getpid());
 #endif
 
 
@@ -1672,7 +1671,7 @@ srandom(time(NULL) & getpid());
         if (strcmp(argv[i],"-d") == 0) {
             debug++;
             if (debug == 1) {
-                DPRINT ("udpbroadcastrelay v1.2.10 built on " __DATE__ " " __TIME__ "\n");
+                DPRINT ("udpbroadcastrelay v1.2.20 built on " __DATE__ " " __TIME__ "\n");
                 DPRINT ("Debugging Mode enabled\n");
             }
         }
@@ -1730,10 +1729,6 @@ srandom(time(NULL) & getpid());
             i++;
             interfaceNames[interfaceNamesNum] = argv[i];
             interfaceNamesNum++;
-        }
-        else if (strcmp(argv[i],"--pid") == 0) {
-            i++;
-            usr_pid = argv[i];
         }
         else if (strcmp(argv[i],"--multicast") == 0) {
             if (multicastAddrsNum >= MAXMULTICAST) {
@@ -1971,7 +1966,9 @@ srandom(time(NULL) & getpid());
         }
         {
             int yes = 1;
-            int no = 0;
+            #ifdef __FreeBSD__
+                int no = 0;
+            #endif
             if (setsockopt(iface->raw_socket, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes))<0) {
                 perror("setsockopt SO_BROADCAST");
                 exit(1);
@@ -2093,7 +2090,7 @@ srandom(time(NULL) & getpid());
     DPRINT("Done Initializing\n\n");
     sprintf(pidfile,"/var/run/udpbroadcastrelay_%d.pid",id);
     if ((pidfp = fopen(pidfile, "w")) != NULL) {
-    fprintf(pidfp, "%d\n", child_pid);
+    fprintf(pidfp, "%d\n", getpid());
     fclose(pidfp);
     strcpy(g_pidfile,pidfile);
     }
