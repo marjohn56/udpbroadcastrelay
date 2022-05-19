@@ -19,6 +19,7 @@ GNU General Public License for more details.
 */
 
 #define MAXIFS    256
+#define MAXCIDRACL 256
 #define MAXMULTICAST 256
 #define MAXBLOCKIDS 256
 #define MAX_MSEARCH_FILTERS 64
@@ -84,6 +85,20 @@ struct Iface {
 };
 static struct Iface ifs[MAXIFS];
 static int maxifs = 0;
+
+#define ACTION_BLOCK 0
+#define ACTION_ALLOW 1
+
+/* list of CIDR ACL entries */
+struct CIDRACL {
+    struct in_addr network;
+    struct in_addr mask;
+    u_short numbits;
+    u_short action;
+};
+static struct CIDRACL CIDRs[MAXCIDRACL];
+static int numCIDRs = 0;
+static int defaultCIDRaction = ACTION_ALLOW;
 
 /* Where we forge our packets */
 static u_char gram[4096+HEADER_LEN]=
@@ -240,9 +255,66 @@ char* ifname_from_idx (int ifindex)
     return ifname_buf;
 }
 
+/* CIDR ACL compare function to qsort with descending mask size */
+int CIDRcompare (const void*a, const void* b)
+{
+ return ((const struct CIDRACL*) b)->numbits - ((const struct CIDRACL*) a)->numbits;
+}
+
+/* Parse CIDR string into a network number and mask. Return 0 if CIDR string is invalid */
+int parse_cidr(char *str, struct CIDRACL* CIDR)
+{
+    char buf[256];
+    char *s;
+    int numbits;
+
+    strncpy(buf, str, sizeof(buf));
+    s = strchr(buf, '/');
+    if (!s) {
+        return 0;
+    }
+    *(s++) = 0;
+    
+    if (!inet_aton(buf, &(CIDR->network))) {
+        return 0;
+    }
+    numbits = atoi(s);
+    if ((numbits < 0) || (numbits > 32)) {
+        return 0;
+    }
+    CIDR->numbits = numbits;
+    CIDR->mask.s_addr = htonl((0xFFFFFFFFUL << (32 - numbits)) & 0xFFFFFFFFUL);
+    CIDR->network.s_addr &= CIDR->mask.s_addr;
+    return 1;
+}
+
 void inet_ntoa2(struct in_addr in, char* chr, int len) {
     char* from = inet_ntoa(in);
     strncpy(chr, from, len);
+}
+
+/* Check if packet should be blocked based on source IP. Return 0 to block packet */
+int check_cidr_acl(struct in_addr fromAddress)
+{
+    int i;
+    int action = defaultCIDRaction;
+    for (i = 0; i < numCIDRs; i++) {
+        if ((fromAddress.s_addr & CIDRs[i].mask.s_addr) == CIDRs[i].network.s_addr) {
+            action = CIDRs[i].action;
+            break;
+        }
+    }
+    if (action == ACTION_BLOCK) {
+        if (i < numCIDRs) {
+            char network[255];
+            inet_ntoa2(CIDRs[i].network, network, sizeof(network));
+            DPRINT("Source IP matches blocked CIDR %s/%i. Packet Ignored.\n\n", network, CIDRs[i].numbits);
+        } else {
+            DPRINT("Source IP does not match any allowed CIDR range. Packet Ignored.\n\n");
+        }
+        return 0;
+    }
+    return 1;
 }
 
 // Print formatted current time for log
@@ -389,6 +461,11 @@ int recv_with_addrinfo (int s, void *buf, size_t buflen, struct Iface **iface_ou
     if (!foundRcvIf) {
         DPRINT("Not from managed iface\n\n");
         return -3;
+    }
+
+    if (numCIDRs) {
+        if (!check_cidr_acl(from_inaddr))
+            return -4;
     }
 
     if (from_inaddr_out) *from_inaddr_out = from_inaddr;
@@ -1549,7 +1626,10 @@ void display_usage(FILE *stream, const char *arg0) {
     fprintf(stream, "usage: %s [--id ID] [--port udp-port]\n"
             "       [--dev dev1] [--dev dev2] [--dev devX]\n"
             "       [-s IP] [--multicast ip1] [--multicast ipX]\n"
-            "       [-t|--ttl-id] [-d] [-f]\n"
+            "       [--msearch action[,search-term]]\n"
+            "       [--blockcidr network-prefix/size]\n"
+            "       [--allowcidr network-prefix/size]\n"
+            "       [--blockid ID] [-t|--ttl-id] [-d] [-f]\n"
             "       [-h|--help]\n", arg0);
 }
 
@@ -1618,6 +1698,17 @@ void display_help(const char *arg0) {
            "  --blockid ID  Block traffic relayed by another udpbroadcastrelay\n"
            "                instance with the specified ID. --blockid can be\n"
            "                specified multiple times to block more than one ID.\n"
+           "  --blockcidr network-prefix/size\n"
+           "                Block traffic from source IP addresses within the\n"
+           "                specified IP range. Where multiple overlapping CIDRs\n"
+           "                are specified with the --blockcidr and --allowcidr\n"
+           "                options the most specific match will take effect.\n"
+           "  --allowcidr network-prefix/size\n"
+           "                Allow traffic from source IP addresses within the\n"
+           "                specified IP range. When one or more --allowcidr\n"
+           "                options are specified the default behaviour changes\n"
+           "                from allowing unmatched traffic to blocking traffic\n"
+           "                without a matching --allowcidr rule.\n"
            "  -d       Enables debugging. Specify twice for extra debug info.\n"
            "  -f       Forces forking to background. A PID file will be created\n"
            "           at /var/run/udpbroadcastrelay_ID.pid\n"
@@ -1671,7 +1762,7 @@ srandom(time(NULL) ^ getpid());
         if (strcmp(argv[i],"-d") == 0) {
             debug++;
             if (debug == 1) {
-                DPRINT ("udpbroadcastrelay v1.2.20 built on " __DATE__ " " __TIME__ "\n");
+                DPRINT ("udpbroadcastrelay v1.3.00 built on " __DATE__ " " __TIME__ "\n");
                 DPRINT ("Debugging Mode enabled\n");
             }
         }
@@ -1715,6 +1806,24 @@ srandom(time(NULL) ^ getpid());
             i++;
             blockIDs[numBlockIDs] = atoi(argv[i]);
             numBlockIDs++;
+        }
+        else if ((strcmp(argv[i],"--blockcidr") == 0) || (strcmp(argv[i],"--allowcidr") == 0)) {
+            u_short action = ACTION_BLOCK;
+            if (strcmp(argv[i],"--allowcidr") == 0) {
+                action = ACTION_ALLOW;
+                defaultCIDRaction = ACTION_BLOCK;
+            }
+            if (numCIDRs >= (MAXCIDRACL)) {
+                fprintf(stderr, "More than maximum %i CIDR ACLs specified.\n", MAXCIDRACL);
+                exit(1);
+            }
+            i++;
+            if (!parse_cidr(argv[i], CIDRs + numCIDRs)) {
+                fprintf(stderr, "Unable to parse CIDR %s\n", argv[i]);
+                exit(1);
+            }
+            CIDRs[numCIDRs].action = action;
+            numCIDRs++;
         }
         else if (strcmp(argv[i],"--port") == 0) {
             i++;
@@ -1813,6 +1922,19 @@ srandom(time(NULL) ^ getpid());
             DPRINT (", %i", blockIDs[i]);
         }
         DPRINT ("\n");
+    }
+
+    if (numCIDRs) {
+        qsort(CIDRs, numCIDRs, sizeof(struct CIDRACL), CIDRcompare);
+        DPRINT ("CIDR access control list:\n");
+        for (i = 0; i < numCIDRs; i++) {
+            char network[255];
+            inet_ntoa2(CIDRs[i].network, network, sizeof(network));
+            char mask[255];
+            inet_ntoa2(CIDRs[i].mask, mask, sizeof(mask));
+            DPRINT ("  %s CIDR %s/%i (mask %s)\n", (CIDRs[i].action == ACTION_ALLOW) ? "Allow" : "Block", network, CIDRs[i].numbits, mask);
+        }
+        DPRINT ("Packets with unmatched CIDR: %s\n\n", (defaultCIDRaction == ACTION_ALLOW) ? "Allow" : "Block");
     }
     
     if (id < 1 || id > MAXID)
@@ -2243,9 +2365,14 @@ srandom(time(NULL) ^ getpid());
                     break;
             }
             if (i < numBlockIDs) {
-                DPRINT ("Packet ID %i matches a blocklist ID. Packet Ignored.\n\n", rxid);
+                DPRINT("Packet ID %i matches a blocklist ID. Packet Ignored.\n\n", rxid);
                 continue;
             }
+        }
+
+        if (numCIDRs) {
+            if (!check_cidr_acl(origFromAddress))
+                continue;
         }
 
         if (!fromIface) {
