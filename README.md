@@ -173,3 +173,5 @@ Recent changes
 - Updated the expiry time for M-SEARCH, Locator and REST proxies.
 - Fixed build information not being printed when `-d` is specififed
 - Introduced a second level of debug info, activated by specifying `-d` twice
+
+Please note: Maintenance of this project is on a 'when I have a moment' basis, and that may be several months.
