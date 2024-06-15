@@ -84,7 +84,7 @@ USAGE
    i.e. the requester will receive an SSDP reponse with a LOCATION referencing
    a host on the other network.
   - `dial`:   perform full DIAL protocol processing on M-SEARCH request.
-  Create proxies for M-SEARCH (same as -`proxy`), Locator and REST services. Use this for
+  Create proxies for M-SEARCH (same as `proxy`), Locator and REST services. Use this for
   Youtube app on Smart TVs. 
   
   When a `search-term` is also specified the given action will only apply
