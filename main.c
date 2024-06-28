@@ -2152,6 +2152,13 @@ srandom(time(NULL) ^ getpid());
             perror("SO_REUSEPORT on rcv");
             exit(1);
         }
+        
+        if (setsockopt(rcv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0)
+        {
+            perror("SO_REUSEADDR on rcv");
+            exit(1);
+        }
+
         #ifdef __FreeBSD__
             if(setsockopt(rcv, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes))<0){
                 perror("IP_RECVTTL on rcv");
