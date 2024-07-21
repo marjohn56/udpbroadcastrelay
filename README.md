@@ -46,11 +46,14 @@ USAGE
       - net_raw
       - net_admin
       - sys_module
+
     See [here](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux_atomic_host/7/html/container_security_guide/linux_capabilities_and_seccomp#linux_capabilities_and_seccomp) for more details.
   - The container image itself may require the cap_net_raw to be enabled
     in the DOCKERFILE: 
-    ```RUN apk add sudo libcap
-RUN setcap 'cap_net_raw+ep' /runtime/udp-broadcast-relay-redux```
+    ```
+    RUN apk add sudo libcap
+    RUN setcap 'cap_net_raw+ep' /runtime/udp-broadcast-relay-redux
+    ```
 - `id` must be unique number between instances with range 1 - 63. This is
   used to set the DSCP of outgoing packets to determine if a packet is an
   echo and should be discarded.
