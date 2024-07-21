@@ -36,9 +36,20 @@ USAGE
     [-h|--help]
 ```
 
-- udpbroadcastrelay must be run as root to be able to create a raw
-  socket (necessary) to send packets as though they originated from the
-  original sender.
+- udpbroadcastrelay must be run as root or via `sudo` to be able to 
+  create a raw socket (necessary) to send packets as though they 
+  originated from the original sender. 
+- If using a non-root sudoer user to run udpbroadcastrelay, special 
+  considerations may need to be addressed if running within a container
+  (e.g. docker). 
+  - The following capabilities may be required. See [url] for more details
+      - net_raw
+      - net_admin
+      - sys_module
+  - The container image itself may require the cap_net_raw to be enabled
+    in the DOCKERFILE: 
+    ```RUN apk add sudo libcap
+RUN setcap 'cap_net_raw+ep' /runtime/udp-broadcast-relay-redux```
 - `id` must be unique number between instances with range 1 - 63. This is
   used to set the DSCP of outgoing packets to determine if a packet is an
   echo and should be discarded.
