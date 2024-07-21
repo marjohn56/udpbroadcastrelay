@@ -42,10 +42,11 @@ USAGE
 - If using a non-root sudoer user to run udpbroadcastrelay, special 
   considerations may need to be addressed if running within a container
   (e.g. docker). 
-  - The following capabilities may be required. See [url] for more details
+  - The following capabilities may be required: 
       - net_raw
       - net_admin
       - sys_module
+    See [here](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux_atomic_host/7/html/container_security_guide/linux_capabilities_and_seccomp#linux_capabilities_and_seccomp) for more details.
   - The container image itself may require the cap_net_raw to be enabled
     in the DOCKERFILE: 
     ```RUN apk add sudo libcap
