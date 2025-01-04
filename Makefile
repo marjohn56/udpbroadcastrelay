@@ -1,14 +1,15 @@
 VERSION=1.1
 
+DESTDIR ?=
+PREFIX ?= /usr/local
+
 udpbroadcastrelay: main.c
-	$(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
+	$(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay $(LDFLAGS)
 
 clean:
 	rm -f udpbroadcastrelay
 
-all:
-	$(CC) $(CFLAGS) -g main.c -o udpbroadcastrelay
+all: udpbroadcastrelay
 
 install:
-	cp udpbroadcastrelay /usr/local/sbin/
-	chmod 755 /usr/local/sbin/udpbroadcastrelay
+	install -Dpm0755 -t $(DESTDIR)$(PREFIX)/sbin/ udpbroadcastrelay
