@@ -1201,8 +1201,9 @@ void handle_locsvc_proxy_recv (int proxyidx, int socktype)
                 if ((numread+lengthChange) < sizeof(buffer)) {
                     memmove(addrEndPtr+lengthChange, addrEndPtr, buffer + numread - addrEndPtr);
                     memcpy(addrStartPtr, addrstr, strlen(addrstr));
+                    numread += lengthChange;
                 }
-                numread += lengthChange;
+                
             } else {
                 DPRINT("Could not find a free REST services proxy slot - sending unmodified response\n\n");
             }
