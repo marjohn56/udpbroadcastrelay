@@ -47,6 +47,7 @@ GNU General Public License for more details.
 
 #include <time.h>
 #include <sys/time.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in_systm.h>
@@ -134,6 +135,7 @@ static u_short fragmentID = 0;
 #define NOTIFY_MARKER "NOTIFY * HTTP/1.1\r\n"
 #define LOCATION_STRING_PREFIX "LOCATION: http://"
 #define APPLICATION_STRING_PREFIX "Application-URL: http://"
+#define HOST_PREFIX "Host: "
 
 #define MSEARCH_ACTION_FORWARD 1        // Forward M-SEARCH just like other UDP packets
 #define MSEARCH_ACTION_BLOCK 2          // Drop M-SEARCH requests with this search string
@@ -148,6 +150,7 @@ struct MSEARCHFilter {
 static struct MSEARCHFilter msearch_filters[MAX_MSEARCH_FILTERS];
 static int num_msearch_filters= 0;
 static int default_msearch_action= MSEARCH_ACTION_FORWARD;
+static int proxyDialHttpHostHeader = 0;
 
 /* list of SSDP M-SEARCH reply listener proxies */
 struct MSEARCHProxy {
@@ -520,7 +523,15 @@ int extract_address (char *str, char *prefix, char **addr_start_ptr, char **addr
     }
 
     startptr += prefixlen;
-    termptr = strchr(startptr,'/');
+    char *hostprefix = "Host: ";
+    if (strcmp(prefix, hostprefix) == 0)
+    {
+        termptr = strchr(startptr, '\r');
+    }
+    else {
+        termptr = strchr(startptr,'/');
+    }
+
     if (!termptr) {
         return 0;
     }
@@ -1188,10 +1199,45 @@ void handle_locsvc_proxy_recv (int proxyidx, int socktype)
 
                 int lengthChange = strlen(addrstr) - (addrEndPtr-addrStartPtr);
                 if ((numread+lengthChange) < sizeof(buffer)) {
-                    memmove(addrEndPtr+lengthChange, addrEndPtr, buffer + numread + 1 - addrEndPtr);
+                    memmove(addrEndPtr+lengthChange, addrEndPtr, buffer + numread - addrEndPtr);
                     memcpy(addrStartPtr, addrstr, strlen(addrstr));
                 }
+                numread += lengthChange;
             } else {
+                DPRINT("Could not find a free REST services proxy slot - sending unmodified response\n\n");
+            }
+        }
+    }
+    else if (proxyDialHttpHostHeader && socktype == LOCSVC_CIENTSOCK)
+    {
+        // Some DIAL servers (TV with embedded ROKU) expect the HTTP `Host` header to match the server's address and port.
+        // Update Host HTTP header to match the address of the DIAL server
+        char *addrStartPtr;
+        char *addrEndPtr;
+        struct in_addr serverAddr;
+        u_short serverPort;
+
+        if (extract_address(buffer, HOST_PREFIX, &addrStartPtr,
+                            &addrEndPtr, &serverAddr, &serverPort)) {
+            struct in_addr dialServerIP = toaddr;
+            struct in_addr proxyAddress = toaddr;
+            u_short proxyPort = find_or_create_restsvc_listener(serverAddr, serverPort, fromlocaladdr);
+            if (proxyPort)
+            {
+                char dialaddrstr[64];
+                char dialServerAddrStr[56];
+                inet_ntoa2(dialServerIP, dialServerAddrStr, sizeof(dialServerAddrStr));
+                snprintf(dialaddrstr, sizeof(dialaddrstr), "%s:%d", dialServerAddrStr, toport);
+                int lengthChange = strlen(dialaddrstr) - (addrEndPtr - addrStartPtr);
+                if ((numread + lengthChange) < sizeof(buffer))
+                {
+                    memmove(addrEndPtr + lengthChange, addrEndPtr, buffer + numread - addrEndPtr);
+                    memcpy(addrStartPtr, dialaddrstr, strlen(dialaddrstr));
+                    numread = numread + lengthChange;
+                }
+            }
+            else
+            {
                 DPRINT("Could not find a free REST services proxy slot - sending unmodified response\n\n");
             }
         }
@@ -1353,6 +1399,7 @@ void handle_msearch_proxy_recv (int proxyidx)
             if ((len+lengthChange) < (sizeof(gram)-HEADER_LEN)) {
                 memmove(addrEndPtr+lengthChange, addrEndPtr, (char*)gram + HEADER_LEN + len + 1 - addrEndPtr);
                 memcpy(addrStartPtr, addrstr, strlen(addrstr));
+                len += lengthChange;
             }
         } else {
             DPRINT("Could not find a free Locator services proxy slot - sending unmodified response\n\n");
@@ -2496,3 +2543,5 @@ srandom(time(NULL) ^ getpid());
         DPRINT ("\n");
     }
 };
+
+/* vim:set ts=4 sw=4 et: */
