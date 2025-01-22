@@ -22,7 +22,7 @@ USAGE
 
 ```
 ./udpbroadcastrelay \
-    -id id \
+    --id id \
     --port <udp-port> \
     --dev eth0 --dev eth1
     [--dev ethx...] \
