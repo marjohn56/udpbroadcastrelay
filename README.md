@@ -65,23 +65,30 @@ USAGE
   `--multicast <group address>`.
 - The source address for all packets can be modified with `-s <ip>`. This
   is unusual.
-- A special source ip of `-s 1.1.1.1` can be used to set the source ip
-  to the address of the outgoing interface and the source UDP port to the
-  same as the destination port. `-s 1.1.1.2` does the same but leaves
-  the UDP ports unchanged. These values are notably required to cater
-  for the Chromecast system.
+- A special source ip of `-s 1.1.1.1` can be used to change the source ip 
+  of the relayed packets to match the ip address of the relay server's 
+  destination interface. Additionally, the source UDP port for the server's
+  destination interface is set to the same destination port found in the 
+  original packet. 
+  `-s 1.1.1.2` does the same but leaves the UDP ports unchanged. These 
+  values are notably required to cater for the Chromecast system.
 - Special SSDP processing can be turned on using the `--msearch` option.
   By default SSDP M-SEARCH packets are treated the same as any other
   packet. The `action` parameter changes this default:
   - `block`:  drop the M-SEARCH packet.
   - `fwd`:    forward the M-SEARCH packet like a regular packet (and the
   `-s` into account).
-  - `proxy`:  create a local proxy for the M-SEARCH request, send request
-  out with subnet local address and proxy port. Received responses are
-  sent back to original requester with no processing.
+  - `proxy`:  create a local proxy for M-SEARCH requests. Set the M-SEARCH 
+    UDP source to the IP of the relay's destination network interface 
+    before relaying. Addtionally, the UDP source port is updated to a port 
+    that is tracked by the proxy for relaying responses back to the 
+    correct requesting host.
+    Received responses are sent back to original requester with no 
+    processing. i.e. the requester will receive an SSDP reponse with a 
+    LOCATION referencing a host on the other network.
   - `dial`:   perform full DIAL protocol processing on M-SEARCH request.
-  Create proxies for M-SEARCH, Locator and REST services. Use this for
-  Youtube app on Smart TVs
+  Create proxies for M-SEARCH (same as `proxy`), Locator and REST services. 
+  Use this for Youtube app on Smart TVs. 
   
   When a `search-term` is also specified the given action will only apply
   to M-SEARCH packets containing this specific search term. `--msearch`
