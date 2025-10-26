@@ -2196,10 +2196,16 @@ srandom(time(NULL) ^ getpid());
             perror("SO_BROADCAST on rcv");
             exit(1);
         };
+        /* allow reuse of address for multicast/broadcast sharing */
+        if(setsockopt(rcv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes))<0) {
+            perror("SO_REUSEADDR on rcv");
+            exit(1);
+        };
+        /* allow reuse of port for multicast/broadcast sharing */
         if (setsockopt(rcv, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes))<0) {
             perror("SO_REUSEPORT on rcv");
             exit(1);
-        }
+        };
         #ifdef __FreeBSD__
             if(setsockopt(rcv, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes))<0){
                 perror("IP_RECVTTL on rcv");
