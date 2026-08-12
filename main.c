@@ -58,7 +58,7 @@ GNU General Public License for more details.
 #include <string.h>
 #include <arpa/inet.h>
 #include <stdio.h>
-#ifdef __FreeBSD__
+#if defined __FreeBSD__ || defined __NetBSD__
 #include <net/if.h>
 #include <net/if_dl.h>
 #else
@@ -342,15 +342,17 @@ void printtime (void)
 int enable_recvmsg_headers (int s, char *callername)
 {
     int yes = 1;
-    #ifdef __FreeBSD__
+    #if defined __FreeBSD__ || defined __NetBSD__
         if(setsockopt(s, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes))<0) {
             fprintf(stderr,"IP_RECVTTL (%s): %s\n",callername,strerror(errno));
             return 0;
         };
+        #ifndef __NetBSD__
         if(setsockopt(s, IPPROTO_IP, IP_RECVTOS, &yes, sizeof(yes))<0) {
             fprintf(stderr,"IP_RECVTOS (%s): %s\n",callername,strerror(errno));
             return 0;
         };
+        #endif // __NetBSD__
         if(setsockopt(s, IPPROTO_IP, IP_RECVIF, &yes, sizeof(yes))<0) {
             fprintf(stderr,"IP_RECVIF (%s): %s\n",callername,strerror(errno));
             return 0;
@@ -414,7 +416,7 @@ int recv_with_addrinfo (int s, void *buf, size_t buflen, struct Iface **iface_ou
     int foundRcvIp = 0;
     if (rcv_msg.msg_controllen > 0) {
         for (cmsg=CMSG_FIRSTHDR(&rcv_msg);cmsg;cmsg=CMSG_NXTHDR(&rcv_msg,cmsg)) {
-            #ifdef __FreeBSD__
+            #if defined __FreeBSD__ || defined __NetBSD__
                 if (cmsg->cmsg_type==IP_RECVDSTADDR) {
                     to_inaddr=*((struct in_addr *)CMSG_DATA(cmsg));
                     foundRcvIp = 1;
@@ -1428,7 +1430,7 @@ void handle_msearch_proxy_recv (int proxyidx)
     *(u_short*)(gram+4)=htons(fragmentID++);
     *(u_short*)(gram+20)=htons(fromPort);
     *(u_short*)(gram+22)=htons(toPort);
-    #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
+    #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__ || defined __NetBSD__
     *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
     *(u_short*)(gram+2)=HEADER_LEN + len;
     #else
@@ -2049,7 +2051,7 @@ srandom(time(NULL) ^ getpid());
                     perror("ioctl(SIOCGIFINDEX)");
                     exit(1);
                 }
-                #ifdef __FreeBSD__
+                #if defined __FreeBSD__ || defined __NetBSD__
                 iface->ifindex = req.ifr_index;
                 #else
                 iface->ifindex = req.ifr_ifindex;
@@ -2136,7 +2138,7 @@ srandom(time(NULL) ^ getpid());
         }
         {
             int yes = 1;
-            #ifdef __FreeBSD__
+            #if defined __FreeBSD__ || defined __NetBSD__
                 int no = 0;
             #endif
             if (setsockopt(iface->raw_socket, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes))<0) {
@@ -2151,7 +2153,7 @@ srandom(time(NULL) ^ getpid());
                 perror("setsockopt SO_REUSEPORT");
                 exit(1);
             }
-            #ifdef __FreeBSD__
+            #if defined __FreeBSD__ || defined __NetBSD__
                 if((setsockopt(iface->raw_socket, IPPROTO_IP, IP_MULTICAST_LOOP, &no, sizeof(no))) < 0) {
                     perror("setsockopt IP_MULTICAST_LOOP");
                 }
@@ -2200,15 +2202,17 @@ srandom(time(NULL) ^ getpid());
             perror("SO_REUSEPORT on rcv");
             exit(1);
         }
-        #ifdef __FreeBSD__
+        #if defined __FreeBSD__ || defined __NetBSD__
             if(setsockopt(rcv, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes))<0){
                 perror("IP_RECVTTL on rcv");
                 exit(1);
             };
+            #ifndef __NetBSD__
             if(setsockopt(rcv, IPPROTO_IP, IP_RECVTOS, &yes, sizeof(yes))<0){
                 perror("IP_RECVTOS on rcv");
                 exit(1);
             };
+            #endif // __NetBSD__
             if(setsockopt(rcv, IPPROTO_IP, IP_RECVIF, &yes, sizeof(yes))<0){
                 perror("IP_RECVIF on rcv");
                 exit(1);
@@ -2303,14 +2307,16 @@ srandom(time(NULL) ^ getpid());
         int foundRcvIp = 0;
         if (rcv_msg.msg_controllen > 0) {
             for (cmsg=CMSG_FIRSTHDR(&rcv_msg);cmsg;cmsg=CMSG_NXTHDR(&rcv_msg,cmsg)) {
-                #ifdef __FreeBSD__
+                #if defined __FreeBSD__ || defined __NetBSD__
                     if (cmsg->cmsg_type==IP_RECVTTL) {
                         rcv_ttl = *(int *)CMSG_DATA(cmsg);
                     }
+                    #ifndef __NetBSD__
                     if (cmsg->cmsg_type==IP_RECVTOS) {
                         rcv_tos = *(int *)CMSG_DATA(cmsg);
                         found_rcv_tos = 1;
                     }
+                    #endif // __NetBSD__
                     if (cmsg->cmsg_type==IP_RECVDSTADDR) {
                         rcv_inaddr=*((struct in_addr *)CMSG_DATA(cmsg));
                         foundRcvIp = 1;
@@ -2349,6 +2355,8 @@ srandom(time(NULL) ^ getpid());
             perror("TTL not found on incoming packet\n");
             continue;
         }
+
+        #ifndef __NetBSD__
         if (!found_rcv_tos) {
             if (use_ttl_id) {
                 /*
@@ -2362,6 +2370,7 @@ srandom(time(NULL) ^ getpid());
                 continue;
             }
         }
+		#endif // __NetBSD__
 
         struct Iface* fromIface = NULL;
         for (int iIf = 0; iIf < maxifs; iIf++) {
@@ -2518,7 +2527,7 @@ srandom(time(NULL) ^ getpid());
             *(u_short*)(gram+4)=htons(fragmentID++);
             *(u_short*)(gram+20)=htons(fromPort);
             *(u_short*)(gram+22)=htons(toPort);
-            #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
+            #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__ || defined __NetBSD__
             *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
             *(u_short*)(gram+2)=HEADER_LEN + len;
             #else
