@@ -1770,6 +1770,9 @@ int main(int argc,char **argv) {
     FILE *pidfp;
     int forking = 0;
     int use_ttl_id = 0;
+#ifndef		__NetBSD__
+    use_ttl_id = 1;	/* No VTOS on NetBSD */
+#endif //	 __NetBSD__
     u_int16_t port = 0;
     u_char id = 0;
     char* multicastAddrs[MAXMULTICAST];
