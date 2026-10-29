@@ -2103,9 +2103,9 @@ srandom(time(NULL) ^ getpid());
                     &((struct sockaddr_in *)&req.ifr_broadaddr)->sin_addr,
                     sizeof(struct in_addr)
                 );
-            } else {
+            } else if (ifFlags & IFF_POINTOPOINT) {
                 if (ioctl(fd,SIOCGIFDSTADDR, &req) < 0) {
-                    perror("ioctl(SIOCGIFBRDADDR)");
+                    perror("ioctl(SIOCGIFDSTADDR)");
                     exit(1);
                 }
                 memcpy(
@@ -2113,6 +2113,9 @@ srandom(time(NULL) ^ getpid());
                     &((struct sockaddr_in *)&req.ifr_dstaddr)->sin_addr,
                     sizeof(struct in_addr)
                 );
+            } else {
+                /* WireGuard has neither a broadcast nor a point-to-point address. */
+                iface->dstaddr.s_addr = INADDR_ANY;
             }
         }
 
@@ -2466,8 +2469,11 @@ srandom(time(NULL) ^ getpid());
 
             struct in_addr toAddress;
             if (rcv_inaddr.s_addr == INADDR_BROADCAST
-                || rcv_inaddr.s_addr == fromIface->dstaddr.s_addr) {
+                || (fromIface->dstaddr.s_addr != INADDR_ANY
+                    && rcv_inaddr.s_addr == fromIface->dstaddr.s_addr)) {
                 // Received on interface broadcast address -- rewrite to new interface broadcast addr
+                if (iface->dstaddr.s_addr == INADDR_ANY)
+                    continue;
                 toAddress = iface->dstaddr;
             } else {
                 // Send to whatever IP it was originally to
